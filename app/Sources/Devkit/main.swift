@@ -65,6 +65,7 @@ final class ServerProcess {
         var env = ProcessInfo.processInfo.environment
         env["DEVKIT_DATA"] = dataDir.path
         env["PYTHONDONTWRITEBYTECODE"] = "1"   // the app bundle is signed and must stay unmodified
+        env["DEVKIT_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)  // server exits if the app dies
         p.environment = env
         p.standardOutput = log
         p.standardError = log
@@ -113,6 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let loginItem = NSMenuItem(title: L.loginItem, action: #selector(toggleLogin), keyEquivalent: "")
     private let screenItem = NSMenuItem(title: L.screen, action: #selector(requestScreen), keyEquivalent: "")
     private var lastPing: [String: Any]?
+    private var signalSources: [DispatchSourceSignal] = []
 
     private var dataDir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Devkit")
@@ -126,6 +128,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         server = ServerProcess(resources: Bundle.main.resourceURL!, dataDir: dataDir)
         server.onExit = { [weak self] in self?.render(nil) }
         server.start()
+
+        // Quit cleanly on SIGTERM/SIGINT (kill, logout) so the server child is stopped too.
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { NSApp.terminate(nil) }
+            src.resume()
+            signalSources.append(src)
+        }
 
         timer = Timer.scheduledTimer(withTimeInterval: Const.pollInterval, repeats: true) { [weak self] _ in self?.poll() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.poll() }

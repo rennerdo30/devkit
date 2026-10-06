@@ -139,6 +139,18 @@ def watch_jobs():
         time.sleep(WATCH_INTERVAL)
 
 
+PARENT_CHECK_SECONDS = 2
+
+
+def watch_parent(pid):
+    """Started by Devkit.app: exit when the app is gone, so no orphaned server keeps the port."""
+    while True:
+        time.sleep(PARENT_CHECK_SECONDS)
+        if os.getppid() != pid:
+            log.warning("parent app %s is gone; shutting down", pid)
+            os._exit(0)
+
+
 def sample_metrics():
     while True:
         try:
@@ -561,6 +573,8 @@ def main():
     srv.daemon_threads = True
     for fn in (watch_jobs, sample_metrics):
         threading.Thread(target=fn, daemon=True).start()
+    if os.environ.get("DEVKIT_PARENT_PID", "").isdigit():
+        threading.Thread(target=watch_parent, args=(int(os.environ["DEVKIT_PARENT_PID"]),), daemon=True).start()
     presence.event("devkit", "server started", "info")
     log.info("%s listening on %s:%s (UI /, API /api, MCP /mcp)", peers.self_name, *srv.server_address[:2])
     srv.serve_forever()
