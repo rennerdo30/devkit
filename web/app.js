@@ -59,6 +59,9 @@ const T = {
     active: "active", lastSeen: "last seen", via: "via", requests: "{n} requests",
     settingsTitle: "Settings", language: "Language", theme: "Theme", themeAuto: "Match system", themeLight: "Light", themeDark: "Dark",
     forget: "Forget access token", agentsSetup: "Connect an agent", agentsSetupText: "Agents use the MCP endpoint with the same access token.",
+    pluginText: "In Claude Code, install the devkit plugin. It asks for this address and a token.", agentToken: "Create agent token",
+    pluginTokenHint: "Create an Operator token for each agent (button above).", pluginReconfigure: "Change them later with /plugin configure devkit@devkit.",
+    otherMcp: "Other MCP clients",
     api: "HTTP API", saved: "Saved", queued: "Queued {k}", cancelled: "Cancelled", save: "Save", close: "Close", create: "Create project",
     pName: "Name", pRepo: "Repository URL", pRef: "Default branch", pXcode: "Xcode project or workspace", pBundle: "Bundle ID",
     pTeam: "Team ID", pTarget: "Default platform", pDevice: "Default device", pUnityTarget: "Unity build target", pUnityMethod: "Unity build method",
@@ -127,6 +130,9 @@ const T = {
     active: "aktiv", lastSeen: "zuletzt", via: "über", requests: "{n} Anfragen",
     settingsTitle: "Einstellungen", language: "Sprache", theme: "Darstellung", themeAuto: "Wie System", themeLight: "Hell", themeDark: "Dunkel",
     forget: "Zugangstoken vergessen", agentsSetup: "Agent verbinden", agentsSetupText: "Agents nutzen den MCP-Endpunkt mit demselben Zugangstoken.",
+    pluginText: "In Claude Code das Devkit-Plugin installieren. Es fragt nach dieser Adresse und einem Token.", agentToken: "Agent-Token erstellen",
+    pluginTokenHint: "Für jeden Agent einen Operator-Token erstellen (Schaltfläche oben).", pluginReconfigure: "Später ändern mit /plugin configure devkit@devkit.",
+    otherMcp: "Andere MCP-Clients",
     api: "HTTP-API", saved: "Gespeichert", queued: "{k} eingereiht", cancelled: "Abgebrochen", save: "Speichern", close: "Schließen", create: "Projekt anlegen",
     pName: "Name", pRepo: "Repository-URL", pRef: "Standard-Branch", pXcode: "Xcode-Projekt oder -Workspace", pBundle: "Bundle-ID",
     pTeam: "Team-ID", pTarget: "Standardplattform", pDevice: "Standardgerät", pUnityTarget: "Unity-Build-Ziel", pUnityMethod: "Unity-Build-Methode",
@@ -740,14 +746,23 @@ const PAGES = {
 
   settings: {
     render(main) {
-      const origin = location.origin;
+      /* Agents need an address other machines can reach: replace localhost with this host's LAN address. */
+      if (!S.system) pollSystem().then(() => { if (S.system && route().page === "settings") this.render(main); });
+      const lan = S.system && Object.values(S.system.info.ip || {})[0];
+      const origin = /^(localhost|127\.|\[::1\])/.test(location.hostname) && lan ? `${location.protocol}//${lan}:${location.port || 80}` : location.origin;
       const theme = store.get("devkit.theme") || "auto";
       main.innerHTML = `<div class="page-head"><div><h1>${esc(t("settingsTitle"))}</h1></div></div>
         <div class="grid cols-2" style="align-items:start"><section class="panel"><div class="pad stack">
           <div class="field"><label for="s-lang">${esc(t("language"))}</label><select id="s-lang"><option value="en">English</option><option value="de">Deutsch</option></select></div>
           <div class="field"><label for="s-theme">${esc(t("theme"))}</label><select id="s-theme"><option value="auto">${esc(t("themeAuto"))}</option><option value="light">${esc(t("themeLight"))}</option><option value="dark">${esc(t("themeDark"))}</option></select></div>
           <div><button class="btn danger" id="s-forget">${esc(t("forget"))}</button></div></div></section>
-        <section class="panel"><div class="panel-head"><h2>${esc(t("agentsSetup"))}</h2></div><div class="pad stack"><p class="muted" style="margin:0">${esc(t("agentsSetupText"))}</p>
+        <section class="panel"><div class="panel-head"><h2>${esc(t("agentsSetup"))}</h2>${isAdmin() ? `<button class="btn small" id="agent-token">${esc(t("agentToken"))}</button>` : ""}</div><div class="pad stack">
+          <p class="muted" style="margin:0">${esc(t("pluginText"))}</p>
+          <pre class="code">/plugin marketplace add rennerdo30/devkit
+/plugin install devkit@devkit</pre>
+          <dl class="facts"><dt>${esc(t("hostUrl"))}</dt><dd class="mono">${esc(origin)}</dd><dt>${esc(t("token"))}</dt><dd>${esc(t("pluginTokenHint"))}</dd></dl>
+          <p class="muted" style="margin:0">${esc(t("pluginReconfigure"))}</p>
+          <b>${esc(t("otherMcp"))}</b>
           <pre class="code">${esc(JSON.stringify({ mcpServers: { devkit: { type: "http", url: origin + "/mcp", headers: { Authorization: "Bearer <token>" } } } }, null, 2))}</pre>
           <b>${esc(t("api"))}</b><pre class="code">GET  ${esc(origin)}/api/ping | kinds | projects | devices | simulators | system
 GET  ${esc(origin)}/api/jobs?limit=N
@@ -761,6 +776,7 @@ GET  ${esc(origin)}/api/hosts | /api/hosts/&lt;name&gt;/&lt;any path above&gt;</
       $("#s-lang").onchange = e => { lang = e.target.value; store.set("devkit.lang", lang); document.documentElement.lang = lang; render(); };
       $("#s-theme").onchange = e => { store.set("devkit.theme", e.target.value); applyTheme(); };
       $("#s-forget").onclick = () => { token = ""; store.set("devkit.token", null); showConnect(); };
+      if ($("#agent-token")) $("#agent-token").onclick = () => openNewToken();
       if (isAdmin()) { $("#new-token").onclick = openNewToken; loadTokens().then(() => this.drawTokens()); }
     },
     drawTokens() {

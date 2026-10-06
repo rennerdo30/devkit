@@ -1,6 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#17202b"/>
-  <rect x="20" y="9" width="24" height="42" rx="6" fill="none" stroke="#e7eaee" stroke-width="3.5"/>
-  <path d="M28 23.5 L39 30 L28 36.5 Z" fill="#f2a229"/>
-  <rect x="11" y="54" width="42" height="3.5" rx="1.75" fill="#7b8594"/>
+  <rect width="64" height="64" rx="15" fill="#17202b"/>
+  <g transform="translate(0 -2)">
+  <!-- the devkit box: aluminium front, darker base edge -->
+  <rect x="7" y="19" width="50" height="23" rx="5" fill="#b9c0c9"/>
+  <path d="M12 19h40a5 5 0 0 1 5 5v12H7V24a5 5 0 0 1 5-5z" fill="#e7eaee"/>
+  <!-- status light (running amber), disc slot, vents -->
+  <circle cx="15.5" cy="27.5" r="3.2" fill="#f2a229"/>
+  <rect x="23" y="26.1" width="15" height="2.8" rx="1.4" fill="#17202b"/>
+  <g fill="#7b8594"><rect x="44" y="23.5" width="2" height="8" rx="1"/><rect x="48" y="23.5" width="2" height="8" rx="1"/><rect x="52" y="23.5" width="2" height="8" rx="1"/></g>
+  <!-- the bench it stands on -->
+  <rect x="12" y="47" width="40" height="3" rx="1.5" fill="#4c5768"/>
+  </g>
 </svg>

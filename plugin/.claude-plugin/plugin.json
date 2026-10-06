@@ -1,8 +1,24 @@
 {
   "name": "devkit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Build, install, launch, profile and release apps and games on remote devkit hosts (macOS now; Windows and Linux later) through the devkit MCP server.",
   "author": { "name": "rennerdo30" },
   "repository": "https://github.com/rennerdo30/devkit",
-  "keywords": ["xcode", "ios", "unity", "instruments", "build", "mcp"]
+  "keywords": ["xcode", "ios", "unity", "instruments", "build", "mcp"],
+  "userConfig": {
+    "devkit_url": {
+      "type": "string",
+      "title": "Devkit address",
+      "description": "Address of the devkit server, e.g. http://192.168.1.50:7420 or a Tailscale name. Shown in the devkit web UI under Settings.",
+      "default": "http://localhost:7420",
+      "required": true
+    },
+    "devkit_token": {
+      "type": "string",
+      "title": "Access token",
+      "description": "An Operator token from the devkit web UI (Settings → Access tokens). Stored in Claude Code's credential store.",
+      "sensitive": true,
+      "required": true
+    }
+  }
 }

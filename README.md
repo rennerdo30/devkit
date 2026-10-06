@@ -29,23 +29,28 @@ devkit lets the Mac sleep as usual.
 The `plugin/` directory is a Claude Code plugin: it connects the devkit MCP server and adds a skill that teaches Claude
 how to build, install, profile and release through it, plus `/devkit:status` and `/devkit:profile`.
 
-1. Create a token for the agent in the web UI (Settings → Access tokens, role Operator).
-2. Make the address and token available to Claude Code, e.g. in `~/.zshrc`, then restart Claude Code:
+1. In the devkit web UI, open Settings → Access tokens and create an Operator token for the agent. Settings also
+   shows the address to use.
+2. Install the plugin from this repository, in a Claude Code session:
 
-   ```sh
-   export DEVKIT_URL="http://<host>:7420"   # defaults to http://localhost:7420
-   export DEVKIT_TOKEN="<token>"
+   ```
+   /plugin marketplace add rennerdo30/devkit
+   /plugin install devkit@devkit
    ```
 
-3. Install the plugin from this repository:
+   Claude Code asks for the devkit address (e.g. `http://192.168.1.50:7420`) and the token. The token is kept in
+   Claude Code's credential store, not in settings files.
+
+   From a shell instead:
 
    ```sh
    claude plugin marketplace add rennerdo30/devkit
-   claude plugin install devkit@devkit
+   claude plugin install devkit@devkit --config devkit_url=http://192.168.1.50:7420
+   claude plugin configure devkit@devkit      # shows what is still missing; set the token in a session (below)
    ```
 
-   or inside a session: `/plugin marketplace add rennerdo30/devkit`, then `/plugin install devkit@devkit`.
-
+3. Change the address or token later with `/plugin configure devkit@devkit` (or `/plugin` → Installed → devkit →
+   Configure).
 4. Check with `/mcp`: the server shows up as `plugin:devkit:devkit`. Try `/devkit:status`.
 
 Other MCP clients can use the endpoint directly: `POST <host>:7420/mcp` with `Authorization: Bearer <token>`.
