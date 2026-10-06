@@ -1,13 +1,13 @@
 #!/usr/bin/python3
 """devkit: single-queue Xcode/Unity job runner. Every verb prints one JSON object."""
-import argparse, fcntl, hashlib, json, os, platform, re, signal, subprocess, sys, time, uuid
+import argparse, fcntl, hashlib, json, os, platform, re, shutil, signal, subprocess, sys, time, uuid
 
 CODE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 ROOT = os.path.realpath(os.environ.get("DEVKIT_DATA") or CODE)  # data dir; a second instance can use its own
 sys.path.insert(0, os.path.join(CODE, "lib"))
 import devkit_hosts, devkit_kinds  # noqa: E402
 
-JOBS, WORK, ARTIFACTS, DERIVED = (os.path.join(ROOT, d) for d in ("jobs", "work", "artifacts", "derived"))
+JOBS, WORK, ARTIFACTS, DERIVED, INPUTS = (os.path.join(ROOT, d) for d in ("jobs", "work", "artifacts", "derived", "inputs"))
 CONFIG = os.path.join(ROOT, "config.json")
 LOCK = os.path.join(ROOT, "worker.lock")
 KINDS = tuple(sorted(devkit_kinds.KINDS))
@@ -112,6 +112,7 @@ class Ctx:
         self.target, self.device, self.args = st.get("target"), st.get("device"), st.get("args") or ""
         self.work = os.path.join(WORK, st["project"])
         self.derived = os.path.join(DERIVED, st["project"])
+        self.inputs = None  # set when params.from_job stages an earlier job's artifacts
         self.cfg = config()
         self.cancel_file = os.path.join(JOBS, st["id"], "cancel")
 
@@ -220,6 +221,8 @@ def execute(st):
                 st["resolved"] = checkout(st, log)
                 save(st)
             os.makedirs(ctx.derived, exist_ok=True)
+            if ctx.p.get("from_job"):
+                ctx.inputs = stage_inputs(ctx, ctx.p["from_job"])
             devkit_kinds.KINDS[st["kind"]](ctx)
             zip_bundles(ctx)
             state, code = "succeeded", 0
@@ -230,6 +233,7 @@ def execute(st):
         log.write("DEVKIT state=%s\n" % state)
     if awake:
         awake.terminate()
+    shutil.rmtree(os.path.join(INPUTS, st["id"]), ignore_errors=True)
     if state == "failed":
         st["error"] = failure_reason(os.path.join(d, "log.txt"))
     st.update(state=state, exit_code=code, finished=now(), pid=None)
@@ -244,6 +248,22 @@ def keep_awake(kind):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         return None  # not on macOS, or caffeinate missing: jobs still run
+
+
+def stage_inputs(ctx, from_id):
+    """Copy a finished job's artifacts into this job's input dir (APFS clones: instant, no extra disk).
+    The earlier job's files stay untouched; params paths then resolve inside the copy first."""
+    src = load(from_id)  # validates the id
+    if src["state"] != "succeeded":
+        raise Fail("from_job %s is %s; it must have succeeded" % (from_id, src["state"]))
+    if not src.get("artifact_dir") or not os.path.isdir(src["artifact_dir"]):
+        raise Fail("from_job %s has no artifacts" % from_id)
+    dest = os.path.join(INPUTS, ctx.st["id"])
+    shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    ctx.log("DEVKIT using artifacts of job %s (%s %s)" % (from_id, src["kind"], src["project"]))
+    ctx.run(["cp", "-cR", src["artifact_dir"], dest])
+    return dest
 
 
 def zip_bundles(ctx):

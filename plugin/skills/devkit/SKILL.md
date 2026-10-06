@@ -37,6 +37,11 @@ Common jobs:
 | TestFlight / notarized Mac build | `release` | `scheme`, `team_id` |
 | Unity batch build | `unity` | `build_target`, `method` |
 
+To build what an earlier job produced (for example the Xcode project a `unity` job exported), pass that job's id as
+`params.from_job` and give `project`/`workspace` relative to its artifacts, e.g.
+`{"from_job": "<unity job id>", "project": "iOS/Unity-iPhone.xcodeproj", "scheme": "Unity-iPhone"}` with `commit: "none"`.
+The earlier job must have succeeded on the same host.
+
 Pass arguments for the game in `params.launch_args` as a list, for example `["-mute", "-autoplay"]`.
 
 ## Waiting and results

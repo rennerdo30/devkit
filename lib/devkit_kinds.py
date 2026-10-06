@@ -5,6 +5,8 @@ Common params (job "params" object):
   scheme, configuration (default Release for archive/release, Debug otherwise)
   team_id               development team for export options
   extra                 list of extra xcodebuild arguments
+  from_job              id of an earlier succeeded job on this host whose artifacts are used as input, e.g. a
+                        unity job's Xcode export: {"from_job": "<id>", "project": "iOS/Unity-iPhone.xcodeproj"}
 Targets (job "target"): ios (device), ios-sim, macos.
 """
 import glob, os, plistlib, re
@@ -34,12 +36,12 @@ def need_device(ctx):
 
 
 def inside(ctx, rel):
-    """Resolve a params path inside the checkout, artifacts or derived data; never outside."""
-    for base in (ctx.work, ctx.art, ctx.derived):
+    """Resolve a params path inside from_job's artifacts, the checkout, artifacts or derived data; never outside."""
+    for base in [b for b in (ctx.inputs, ctx.work, ctx.art, ctx.derived) if b]:
         p = os.path.realpath(os.path.join(base, rel))
         if p.startswith(os.path.realpath(base) + os.sep) and os.path.exists(p):
             return p
-    raise ctx.Fail("path not found in checkout or artifacts: " + rel)
+    raise ctx.Fail("path not found in %scheckout or artifacts: %s" % ("from_job artifacts, " if ctx.inputs else "", rel))
 
 
 def config_name(ctx, default):
