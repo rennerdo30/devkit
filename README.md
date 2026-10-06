@@ -5,21 +5,38 @@ MCP or a web UI; several devkit servers can be connected and reached through any
 
 v1 runs on macOS (Xcode, iOS devices and simulators, Instruments, Unity). Windows and Linux hosts follow in v2 and v3.
 
-## Run
+## Install (macOS)
+
+Build the menu bar app and install it:
 
 ```sh
-bin/devkit-server            # web UI, API and MCP on http://<host>:7420
+app/build.sh --dmg        # dist/Devkit.app and dist/Devkit.dmg
+```
+
+Open `Devkit.dmg`, drag Devkit to Applications and start it. Devkit lives in the menu bar and runs the server; from
+its menu:
+
+- **Start at Login** registers it as a login item.
+- **Allow Screen Viewing…** grants the screen recording permission the web UI's live screen needs. macOS asks for
+  "Devkit", not for Python.
+- **Copy Owner Token** copies the admin token for the first sign-in to the web UI; **Open Devkit** opens it.
+
+The app keeps its data (tokens, projects, jobs, files) in `~/Library/Application Support/Devkit`. It needs Xcode
+(which provides `/usr/bin/python3`) and macOS 14 or later.
+
+`build.sh` signs with the first Developer ID or Apple Development identity in your keychain (override with
+`DEVKIT_SIGN_IDENTITY`). An ad-hoc signature works too, but macOS then forgets the screen recording permission after
+every rebuild.
+
+### Without the app
+
+```sh
+bin/devkit-server                    # web UI, API and MCP on http://<host>:7420; data next to the code
+bin/install-launchagent              # optional: start at login as a LaunchAgent (--uninstall to remove)
 ```
 
 The first start writes `config.json` with an owner token (admin). Create further tokens in the web UI under
-Settings → Access tokens. Requirements: `/usr/bin/python3` (stdlib only), Xcode, optionally Unity Hub.
-
-Start at login (macOS):
-
-```sh
-bin/install-launchagent              # writes ~/Library/LaunchAgents/dev.devkit.server.plist and loads it
-bin/install-launchagent --uninstall
-```
+Settings → Access tokens.
 
 Jobs keep the Mac awake with `caffeinate` while they run (and the display, for launch and profiling jobs); an idle
 devkit lets the Mac sleep as usual.
@@ -86,10 +103,11 @@ bin/devkit          job queue, worker and CLI
 bin/devkit-server   HTTP server: web UI, API, MCP, peers
 lib/                job kinds, host facts, tokens, peers
 web/                web UI (plain HTML, CSS, JS; English and German)
-launchd/            LaunchAgent template for macOS (installed by bin/install-launchagent)
+app/                macOS menu bar app (Swift) and its build script
+launchd/            LaunchAgent template for running without the app
 plugin/             Claude Code plugin (MCP connection, skills)
 .claude-plugin/     plugin marketplace manifest
 ```
 
-Data (`config.json`, `tokens.json`, `projects.json`, `jobs/`, `artifacts/`, ...) lives next to the code, or in
-`$DEVKIT_DATA` if set. `DEVKIT_PORT` overrides the port.
+Data (`config.json`, `tokens.json`, `projects.json`, `jobs/`, `artifacts/`, ...) lives in `$DEVKIT_DATA` if set
+(the app sets it to `~/Library/Application Support/Devkit`), otherwise next to the code. `DEVKIT_PORT` overrides the port.

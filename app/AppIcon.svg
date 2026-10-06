@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- macOS app icon grid: 824 px body centred on a 1024 px canvas, soft shadow below -->
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#222c39"/><stop offset="1" stop-color="#141b24"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#body)" filter="url(#shadow)"/>
+  <g transform="translate(100 74) scale(12.875)">
+    <rect x="7" y="19" width="50" height="23" rx="5" fill="#b9c0c9"/>
+    <path d="M12 19h40a5 5 0 0 1 5 5v12H7V24a5 5 0 0 1 5-5z" fill="#e7eaee"/>
+    <circle cx="15.5" cy="27.5" r="3.2" fill="#f2a229"/>
+    <rect x="23" y="26.1" width="15" height="2.8" rx="1.4" fill="#17202b"/>
+    <g fill="#7b8594"><rect x="44" y="23.5" width="2" height="8" rx="1"/><rect x="48" y="23.5" width="2" height="8" rx="1"/><rect x="52" y="23.5" width="2" height="8" rx="1"/></g>
+    <rect x="12" y="47" width="40" height="3" rx="1.5" fill="#4c5768"/>
+  </g>
+</svg>

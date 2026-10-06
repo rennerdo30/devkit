@@ -19,3 +19,5 @@ apps-*.json
 __pycache__/
 *.pyc
 .DS_Store
+app/.build/
+dist/
