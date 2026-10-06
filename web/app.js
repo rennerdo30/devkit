@@ -60,6 +60,19 @@ const T = {
     settingsTitle: "Settings", language: "Language", theme: "Theme", themeAuto: "Match system", themeLight: "Light", themeDark: "Dark",
     forget: "Forget access token", agentsSetup: "Connect an agent", agentsSetupText: "Agents use the MCP endpoint with the same access token.",
     pluginText: "In Claude Code, install the devkit plugin. It asks for this address and a token.", agentToken: "Create agent token",
+    wizIntro: "Let Claude Code or another agent use this devkit. The wizard creates a token for it and gives you the setup, ready to paste.",
+    wizStart: "Connect an agent", wizNeedsAdmin: "Ask an admin to connect an agent: it needs a new token.",
+    wizStep1: "Name it", wizStep2: "Set it up", wizStep3: "Check", wizName: "Which agent is this?", wizNamePh: "Claude Code on the Windows PC",
+    wizNameHint: "Its jobs and activity show up under this name. It gets an Operator token: it can run jobs, not manage tokens.",
+    wizClient: "Where does it run?", wizClients: { session: "Claude Code (in a session)", shell: "Claude Code (macOS/Linux shell)", powershell: "Claude Code (Windows PowerShell)", mcp: "Other MCP client" },
+    wizCreate: "Create token", wizNext: "I've set it up", back: "Back",
+    wizSessionText: "In Claude Code, run these two commands:", wizSessionAsk: "Claude Code then asks for the address and the token:",
+    wizSessionAlready: "Plugin already installed? Change the values with:",
+    wizShellText: "Run these commands, then restart Claude Code:",
+    wizShellNote: "The token ends up in your shell history. Needs Claude Code 2.1.285 or later.",
+    wizMcpText: "Add this server to the client's MCP configuration:",
+    wizWaiting: "Waiting for {n}…", wizWaitingText: "In Claude Code, run /mcp or /devkit:status. This turns green as soon as the agent connects.",
+    wizConnected: "{n} is connected", wizConnectedText: "It can now build, install and profile on this devkit.",
     pluginTokenHint: "Create an Operator token for each agent (button above).", pluginReconfigure: "Change them later with /plugin configure devkit@devkit.",
     otherMcp: "Other MCP clients",
     api: "HTTP API", saved: "Saved", queued: "Queued {k}", cancelled: "Cancelled", save: "Save", close: "Close", create: "Create project",
@@ -131,6 +144,19 @@ const T = {
     settingsTitle: "Einstellungen", language: "Sprache", theme: "Darstellung", themeAuto: "Wie System", themeLight: "Hell", themeDark: "Dunkel",
     forget: "Zugangstoken vergessen", agentsSetup: "Agent verbinden", agentsSetupText: "Agents nutzen den MCP-Endpunkt mit demselben Zugangstoken.",
     pluginText: "In Claude Code das Devkit-Plugin installieren. Es fragt nach dieser Adresse und einem Token.", agentToken: "Agent-Token erstellen",
+    wizIntro: "Claude Code oder einen anderen Agent dieses Devkit nutzen lassen. Der Assistent erstellt einen Token und liefert die Einrichtung zum Einfügen.",
+    wizStart: "Agent verbinden", wizNeedsAdmin: "Ein Admin muss den Agent verbinden: Dafür ist ein neuer Token nötig.",
+    wizStep1: "Benennen", wizStep2: "Einrichten", wizStep3: "Prüfen", wizName: "Welcher Agent ist das?", wizNamePh: "Claude Code auf dem Windows-PC",
+    wizNameHint: "Seine Jobs und Aktivitäten erscheinen unter diesem Namen. Er bekommt einen Operator-Token: Jobs starten ja, Tokens verwalten nein.",
+    wizClient: "Wo läuft er?", wizClients: { session: "Claude Code (in einer Sitzung)", shell: "Claude Code (macOS-/Linux-Shell)", powershell: "Claude Code (Windows PowerShell)", mcp: "Anderer MCP-Client" },
+    wizCreate: "Token erstellen", wizNext: "Ist eingerichtet", back: "Zurück",
+    wizSessionText: "In Claude Code diese zwei Befehle ausführen:", wizSessionAsk: "Claude Code fragt dann nach Adresse und Token:",
+    wizSessionAlready: "Plugin schon installiert? Werte ändern mit:",
+    wizShellText: "Diese Befehle ausführen, dann Claude Code neu starten:",
+    wizShellNote: "Der Token landet im Shell-Verlauf. Benötigt Claude Code 2.1.285 oder neuer.",
+    wizMcpText: "Diesen Server in die MCP-Konfiguration des Clients eintragen:",
+    wizWaiting: "Warte auf {n}…", wizWaitingText: "In Claude Code /mcp oder /devkit:status ausführen. Das wird grün, sobald der Agent sich verbindet.",
+    wizConnected: "{n} ist verbunden", wizConnectedText: "Er kann jetzt auf diesem Devkit bauen, installieren und profilieren.",
     pluginTokenHint: "Für jeden Agent einen Operator-Token erstellen (Schaltfläche oben).", pluginReconfigure: "Später ändern mit /plugin configure devkit@devkit.",
     otherMcp: "Andere MCP-Clients",
     api: "HTTP-API", saved: "Gespeichert", queued: "{k} eingereiht", cancelled: "Abgebrochen", save: "Speichern", close: "Schließen", create: "Projekt anlegen",
@@ -748,35 +774,32 @@ const PAGES = {
     render(main) {
       /* Agents need an address other machines can reach: replace localhost with this host's LAN address. */
       if (!S.system) pollSystem().then(() => { if (S.system && route().page === "settings") this.render(main); });
-      const lan = S.system && Object.values(S.system.info.ip || {})[0];
-      const origin = /^(localhost|127\.|\[::1\])/.test(location.hostname) && lan ? `${location.protocol}//${lan}:${location.port || 80}` : location.origin;
+      const origin = agentOrigin();
       const theme = store.get("devkit.theme") || "auto";
       main.innerHTML = `<div class="page-head"><div><h1>${esc(t("settingsTitle"))}</h1></div></div>
         <div class="grid cols-2" style="align-items:start"><section class="panel"><div class="pad stack">
           <div class="field"><label for="s-lang">${esc(t("language"))}</label><select id="s-lang"><option value="en">English</option><option value="de">Deutsch</option></select></div>
           <div class="field"><label for="s-theme">${esc(t("theme"))}</label><select id="s-theme"><option value="auto">${esc(t("themeAuto"))}</option><option value="light">${esc(t("themeLight"))}</option><option value="dark">${esc(t("themeDark"))}</option></select></div>
           <div><button class="btn danger" id="s-forget">${esc(t("forget"))}</button></div></div></section>
-        <section class="panel"><div class="panel-head"><h2>${esc(t("agentsSetup"))}</h2>${isAdmin() ? `<button class="btn small" id="agent-token">${esc(t("agentToken"))}</button>` : ""}</div><div class="pad stack">
-          <p class="muted" style="margin:0">${esc(t("pluginText"))}</p>
-          <pre class="code">/plugin marketplace add rennerdo30/devkit
-/plugin install devkit@devkit</pre>
-          <dl class="facts"><dt>${esc(t("hostUrl"))}</dt><dd class="mono">${esc(origin)}</dd><dt>${esc(t("token"))}</dt><dd>${esc(t("pluginTokenHint"))}</dd></dl>
-          <p class="muted" style="margin:0">${esc(t("pluginReconfigure"))}</p>
-          <b>${esc(t("otherMcp"))}</b>
+        <section class="panel"><div class="panel-head"><h2>${esc(t("agentsSetup"))}</h2></div><div class="pad stack">
+          <p class="muted" style="margin:0">${esc(t("wizIntro"))}</p>
+          <dl class="facts"><dt>${esc(t("hostUrl"))}</dt><dd class="mono">${esc(origin)}</dd></dl>
+          ${isAdmin() ? `<div><button class="btn primary" id="agent-wizard">${esc(t("wizStart"))}</button></div>` : `<p class="muted" style="margin:0">${esc(t("wizNeedsAdmin"))}</p>`}
+          <details><summary class="muted" style="cursor:pointer">${esc(t("otherMcp"))} · ${esc(t("api"))}</summary><div class="stack" style="margin-top:12px">
           <pre class="code">${esc(JSON.stringify({ mcpServers: { devkit: { type: "http", url: origin + "/mcp", headers: { Authorization: "Bearer <token>" } } } }, null, 2))}</pre>
           <b>${esc(t("api"))}</b><pre class="code">GET  ${esc(origin)}/api/ping | kinds | projects | devices | simulators | system
 GET  ${esc(origin)}/api/jobs?limit=N
 POST ${esc(origin)}/api/jobs  {"project","commit","kind","target","device","params"}
 GET  ${esc(origin)}/api/jobs/&lt;id&gt; | /log?tail=N | /artifacts
 POST ${esc(origin)}/api/jobs/&lt;id&gt;/cancel
-GET  ${esc(origin)}/api/hosts | /api/hosts/&lt;name&gt;/&lt;any path above&gt;</pre></div></section></div>
+GET  ${esc(origin)}/api/hosts | /api/hosts/&lt;name&gt;/&lt;any path above&gt;</pre></div></details></div></section></div>
         ${isAdmin() ? `<section class="panel" style="margin-top:18px"><div class="panel-head"><div><h2>${esc(t("tokens"))}</h2></div><button class="btn primary small" id="new-token">${esc(t("newToken"))}</button></div>
           <p class="muted pad" style="margin:0;padding-bottom:0">${esc(t("tokensText"))}</p><div class="table-wrap" id="tok-table"></div></section>` : ""}`;
       $("#s-lang").value = lang; $("#s-theme").value = theme;
       $("#s-lang").onchange = e => { lang = e.target.value; store.set("devkit.lang", lang); document.documentElement.lang = lang; render(); };
       $("#s-theme").onchange = e => { store.set("devkit.theme", e.target.value); applyTheme(); };
       $("#s-forget").onclick = () => { token = ""; store.set("devkit.token", null); showConnect(); };
-      if ($("#agent-token")) $("#agent-token").onclick = () => openNewToken();
+      if ($("#agent-wizard")) $("#agent-wizard").onclick = () => agentWizard();
       if (isAdmin()) { $("#new-token").onclick = openNewToken; loadTokens().then(() => this.drawTokens()); }
     },
     drawTokens() {
@@ -929,6 +952,82 @@ function openProject(p) {
     await loadProjects(); toast(t("saved")); location.hash = "#/projects/" + encodeURIComponent(r.project.name); render();
   });
 }
+/* The address other machines use: this page's address, or the LAN address when the page was opened via localhost. */
+function agentOrigin() {
+  const lan = S.system && Object.values(S.system.info.ip || {})[0];
+  return /^(localhost|127\.|\[::1\])/.test(location.hostname) && lan ? `${location.protocol}//${lan}:${location.port || 80}` : location.origin;
+}
+const PLUGIN_ID = "devkit@devkit", PLUGIN_REPO = "rennerdo30/devkit";
+const WIZ_CLIENTS = ["session", "shell", "powershell", "mcp"];
+const WIZ_CONNECT_POLL_MS = 3000;
+
+/* Three steps: name the agent (creates an operator token), copy the prefilled setup for its client, wait until it connects. */
+function agentWizard() {
+  const w = { step: 1, name: store.get("devkit.wiz.name") || "", client: store.get("devkit.wiz.client") || "session", token: null, origin: agentOrigin(), timer: null };
+  const copyBtn = (id, text) => `<button type="button" class="btn small" data-copy="${id}">${esc(t("copy"))}</button>`;
+  const block = (id, text) => `<div class="wiz-code"><pre class="code" id="${id}">${esc(text)}</pre>${copyBtn(id, text)}</div>`;
+  const json = () => JSON.stringify({ devkit_url: w.origin, devkit_token: w.token });
+  const setup = () => ({
+    session: `<p class="muted">${esc(t("wizSessionText"))}</p>${block("c1", `/plugin marketplace add ${PLUGIN_REPO}\n/plugin install ${PLUGIN_ID}`)}
+      <p class="muted">${esc(t("wizSessionAsk"))}</p><dl class="facts"><dt>${esc(t("hostUrl"))}</dt><dd>${block("c2", w.origin)}</dd><dt>${esc(t("token"))}</dt><dd>${block("c3", w.token)}</dd></dl>
+      <p class="muted">${esc(t("wizSessionAlready"))}</p>${block("c4", `/plugin configure ${PLUGIN_ID}`)}`,
+    shell: `<p class="muted">${esc(t("wizShellText"))}</p>${block("c1", `claude plugin marketplace add ${PLUGIN_REPO}\nclaude plugin install ${PLUGIN_ID}\necho '${json()}' | claude plugin configure ${PLUGIN_ID} --values-stdin`)}<p class="faint">${esc(t("wizShellNote"))}</p>`,
+    powershell: `<p class="muted">${esc(t("wizShellText"))}</p>${block("c1", `claude plugin marketplace add ${PLUGIN_REPO}\nclaude plugin install ${PLUGIN_ID}\n'${json()}' | claude plugin configure ${PLUGIN_ID} --values-stdin`)}<p class="faint">${esc(t("wizShellNote"))}</p>`,
+    mcp: `<p class="muted">${esc(t("wizMcpText"))}</p>${block("c1", JSON.stringify({ mcpServers: { devkit: { type: "http", url: w.origin + "/mcp", headers: { Authorization: "Bearer " + w.token } } } }, null, 2))}`,
+  }[w.client]);
+  const steps = () => `<ol class="wiz-steps">${[t("wizStep1"), t("wizStep2"), t("wizStep3")].map((s, i) => `<li class="${i + 1 < w.step ? "done" : i + 1 === w.step ? "now" : ""}">${esc(s)}</li>`).join("")}</ol>`;
+  const stop = () => { clearInterval(w.timer); w.timer = null; };
+
+  function draw() {
+    const body = w.step === 1 ? `
+        ${field("name", t("wizName"), input("name", w.name, `required maxlength="60" placeholder="${esc(t("wizNamePh"))}"`), { full: true, hint: t("wizNameHint") })}
+        <div class="field full"><label>${esc(t("wizClient"))}</label><div class="pills" role="radiogroup">${WIZ_CLIENTS.map(c =>
+          `<button type="button" role="radio" data-client="${c}" aria-pressed="${c === w.client}">${esc(t("wizClients." + c))}</button>`).join("")}</div></div>`
+      : w.step === 2 ? `<div class="full stack">${setup()}<p class="faint">${esc(t("tokenOnce"))}</p></div>`
+      : `<div class="full wiz-wait"><span class="mark ${w.seen ? "succeeded" : "running"}" aria-hidden="true">${w.seen ? "✓" : ""}</span>
+          <div><b>${esc(w.seen ? t("wizConnected", { n: w.name }) : t("wizWaiting", { n: w.name }))}</b>
+          <p class="muted" style="margin:4px 0 0">${esc(w.seen ? t("wizConnectedText") : t("wizWaitingText"))}</p></div></div>`;
+    const next = w.step === 1 ? t("wizCreate") : w.step === 2 ? t("wizNext") : t("done");
+    dlg.innerHTML = `<form method="dialog" novalidate><div class="dlg-head"><h2>${esc(t("wizStart"))}</h2>${steps()}</div>
+      <div class="dlg-body">${body}</div>
+      <div class="dlg-foot"><span class="dlg-err err" role="alert"></span><div class="actions">
+        ${w.step === 2 ? `<button type="button" class="btn" data-back>${esc(t("back"))}</button>` : `<button type="button" class="btn" data-close>${esc(t("close"))}</button>`}
+        <button class="btn primary">${esc(next)}</button></div></div></form>`;
+    const form = $("form", dlg);
+    dlg.querySelectorAll("[data-client]").forEach(b => b.onclick = () => { w.name = form.elements.name ? form.elements.name.value : w.name; w.client = b.dataset.client; draw(); });
+    dlg.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
+      const text = $("#" + b.dataset.copy).textContent;
+      try { await navigator.clipboard.writeText(text); b.textContent = t("copied"); }
+      catch (e) { const r = document.createRange(); r.selectNodeContents($("#" + b.dataset.copy)); getSelection().removeAllRanges(); getSelection().addRange(r); }
+    });
+    const back = $("[data-back]", dlg); if (back) back.onclick = () => { w.client = WIZ_CLIENTS[(WIZ_CLIENTS.indexOf(w.client))]; w.step = 1; w.reuse = true; draw(); };
+    const close = $("[data-close]", dlg); if (close) close.onclick = () => dlg.close();
+    form.onsubmit = async e => {
+      e.preventDefault();
+      const err = $(".dlg-err", dlg); err.textContent = "";
+      try {
+        if (w.step === 1) {
+          if (!form.reportValidity()) return;
+          w.name = form.elements.name.value.trim();
+          store.set("devkit.wiz.name", w.name); store.set("devkit.wiz.client", w.client);
+          if (!w.token) { const r = await post("/api/tokens", { name: w.name, role: "operator" }); w.token = r.token; w.tokenName = r.name; await loadTokens(); PAGES.settings.drawTokens(); }
+          w.step = 2;
+        } else if (w.step === 2) {
+          w.step = 3; w.seen = false;
+          w.timer = setInterval(async () => {
+            try { const { clients } = await api("/api/clients");
+              if (clients.some(c => c.token === w.tokenName && c.active)) { w.seen = true; stop(); draw(); } } catch (x) { /* keep waiting */ }
+          }, WIZ_CONNECT_POLL_MS);
+        } else { dlg.close(); return; }
+        draw();
+      } catch (x) { err.textContent = x.message; }
+    };
+  }
+  dlg.addEventListener("close", function done() { if (dlg.open) return; stop(); dlg.innerHTML = ""; dlg.removeEventListener("close", done); });
+  draw();
+  dlg.showModal();
+}
+
 function openNewToken() {
   openDialog(`<div class="dlg-head"><h2>${esc(t("newToken"))}</h2></div><div class="dlg-body">
       ${field("name", t("tokenName"), input("name", "", 'required maxlength="60"'), { full: true, hint: t("tokenNameHint") })}

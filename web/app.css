@@ -299,3 +299,15 @@ dialog::backdrop { background: rgba(20, 26, 33, .5); }
 @media (prefers-reduced-motion: reduce) {
   .mark.running { animation: none; border-right-color: var(--run-mark); }
 }
+
+/* ---------- agent wizard ---------- */
+.wiz-steps { list-style: none; display: flex; gap: 6px; padding: 0; margin: 12px 0 0; font-size: 13px; counter-reset: s; }
+.wiz-steps li { flex: 1; padding-top: 8px; border-top: 3px solid var(--rule); color: var(--ink-3); counter-increment: s; }
+.wiz-steps li::before { content: counter(s) ". "; }
+.wiz-steps li.done { border-color: var(--ok); color: var(--ink-2); }
+.wiz-steps li.now { border-color: var(--ink); color: var(--ink); font-weight: 600; }
+.wiz-code { display: flex; gap: 8px; align-items: flex-start; }
+.wiz-code pre { flex: 1; min-width: 0; margin: 0; }
+.wiz-wait { display: flex; gap: 14px; align-items: flex-start; padding: 10px 0 6px; }
+.wiz-wait .mark { width: 26px; height: 26px; font-size: 14px; }
+.dlg-body .stack p { margin: 0; }
