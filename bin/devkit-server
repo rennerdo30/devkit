@@ -1,0 +1,570 @@
+#!/usr/bin/python3
+"""devkit-server: web UI, HTTP JSON API and MCP (streamable HTTP, JSON responses) over the devkit job queue.
+Several servers (macOS now; Windows and Linux later) can be connected as peers and reached through any one of them."""
+import argparse, collections, importlib.machinery, json, logging, mimetypes, os, re, secrets, sys, threading, time, types, urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+CODE = os.path.dirname(BIN)
+ROOT = os.path.realpath(os.environ.get("DEVKIT_DATA") or CODE)
+CONFIG = os.path.join(ROOT, "config.json")
+TOKENS = os.path.join(ROOT, "tokens.json")
+WEB = os.path.join(CODE, "web")
+DEFAULT_PORT = 7420
+DEFAULT_LIMIT = 20
+MAX_BODY = 1 << 20
+MCP_PROTOCOL = "2025-06-18"
+VERSION = "0.5.0"
+CLIENT_ACTIVE_SECONDS = 60
+ACTIVITY_SIZE = 300
+ACTIVITY_LOG = os.path.join(ROOT, "logs", "activity.jsonl")
+READ_ARTIFACT_MAX = 512 * 1024
+TEXT_ARTIFACTS = (".json", ".txt", ".log", ".xml", ".md", ".csv", ".plist", ".ips", ".crash")
+METRICS_INTERVAL = 3
+METRICS_HISTORY = 200
+WATCH_INTERVAL = 2
+STATIC_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json"}
+
+_loader = importlib.machinery.SourceFileLoader("devkit", os.path.join(BIN, "devkit"))
+dk = types.ModuleType(_loader.name)
+dk.__file__ = _loader.path
+_loader.exec_module(dk)
+import devkit_auth as auth, devkit_hosts as hosts, devkit_system as system  # noqa: E402  (lib/ is on sys.path via devkit)
+
+ERRORS = (dk.Fail, OSError, ValueError, KeyError, dk.subprocess.SubprocessError, hosts.PeerError)
+log = logging.getLogger("devkit-server")
+config_lock = threading.Lock()
+
+
+def load_config():
+    with config_lock:
+        if not os.path.exists(CONFIG):
+            os.makedirs(ROOT, exist_ok=True)
+            fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"token": secrets.token_urlsafe(32), "port": DEFAULT_PORT, "bind": "0.0.0.0"}, f, indent=1)
+            log.warning("created %s with a new owner token", CONFIG)
+        with open(CONFIG) as f:
+            return json.load(f)
+
+
+def save_config(cfg):
+    with config_lock:
+        tmp = CONFIG + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f, indent=1)
+        os.replace(tmp, CONFIG)
+
+
+def ns(**kw):
+    return argparse.Namespace(**kw)
+
+
+_name = []
+
+
+def self_name():
+    if not _name:
+        _name.append(load_config().get("name") or dk.platform.node().split(".")[0])
+    return _name[0]
+
+
+# ---------------------------------------------------------------- who is connected, and what happened
+class Presence:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.clients = {}
+        self.activity = collections.deque(maxlen=ACTIVITY_SIZE)
+        try:
+            with open(ACTIVITY_LOG) as f:
+                for line in collections.deque(f, maxlen=ACTIVITY_SIZE):
+                    self.activity.appendleft(json.loads(line))
+        except (OSError, ValueError):
+            pass
+
+    def event(self, who, text, kind="info", job=None):
+        ev = {"time": time.time(), "who": who, "text": text, "kind": kind, "job": job}
+        with self.lock:
+            self.activity.appendleft(ev)
+            try:
+                os.makedirs(os.path.dirname(ACTIVITY_LOG), exist_ok=True)
+                with open(ACTIVITY_LOG, "a") as f:
+                    f.write(json.dumps(ev) + "\n")
+            except OSError:
+                log.warning("could not append to %s", ACTIVITY_LOG)
+
+    def seen(self, ip, label, token_name, role, channel, action):
+        key = (ip, label)
+        with self.lock:
+            c = self.clients.get(key)
+            new = c is None or time.time() - c["last_seen"] > CLIENT_ACTIVE_SECONDS
+            if c is None:
+                c = self.clients[key] = {"label": label, "ip": ip, "first_seen": time.time(), "requests": 0}
+            c.update(last_seen=time.time(), last_action=action, channel=channel, token=token_name, role=role)
+            c["requests"] += 1
+        if new:
+            self.event(label, "connected from %s via %s" % (ip, channel), "connect")
+
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            out = [dict(c, active=now - c["last_seen"] < CLIENT_ACTIVE_SECONDS) for c in self.clients.values()]
+        return sorted(out, key=lambda c: -c["last_seen"])
+
+
+presence = Presence()
+mcp_names = {}  # (ip, user agent) -> clientInfo name from MCP initialize
+metrics_history = collections.deque(maxlen=METRICS_HISTORY)
+screen = system.Screen()
+tokens = None  # set in main()
+peers = hosts.Peers(load_config, save_config, None)
+
+
+def watch_jobs():
+    """Turns job state changes into activity events."""
+    known = {}
+    while True:
+        try:
+            for st in dk.all_jobs()[-100:]:
+                prev = known.get(st["id"])
+                if prev is not None and prev != st["state"] and st["state"] != "queued":
+                    verb = {"running": "started", "succeeded": "succeeded", "failed": "failed", "cancelled": "was cancelled"}[st["state"]]
+                    why = ": " + st["error"] if st["state"] == "failed" and st.get("error") else ""
+                    presence.event(st.get("requested_by") or "cli", "%s %s %s%s" % (st["kind"], st["project"], verb, why), st["state"], st["id"])
+                known[st["id"]] = st["state"]
+        except Exception:  # never let the watcher die
+            log.exception("job watcher")
+        time.sleep(WATCH_INTERVAL)
+
+
+def sample_metrics():
+    while True:
+        try:
+            metrics_history.append(system.metrics())
+        except Exception:
+            log.exception("metrics sampler")
+        time.sleep(METRICS_INTERVAL)
+
+
+# ---------------------------------------------------------------- operations shared by REST and MCP
+def op_queue(p, who):
+    for k in ("project", "commit", "kind"):
+        if not p.get(k):
+            raise dk.Fail("missing " + k)
+    r = dk.v_queue(ns(project=p["project"], repo=p.get("repo"), commit=p["commit"], kind=p["kind"], target=p.get("target"),
+                      device=p.get("device"), args=p.get("args"), params=p.get("params"), by=who))
+    where = " at " + p["commit"] if p["commit"] != "none" else ""
+    presence.event(who, "queued %s %s%s" % (p["kind"], p["project"], where), "queued", r["id"])
+    return dict(r, host=self_name())
+
+
+def op_cancel(p, who):
+    r = dk.v_cancel(ns(id=p.get("id")))
+    presence.event(who, "cancelled job %s" % p.get("id"), "cancelled", p.get("id"))
+    return r
+
+
+def op_project_save(p, who):
+    r = dk.v_project_save(ns(project=p.get("project") or p, previous=p.get("previous")))
+    presence.event(who, "saved project %s" % r["project"]["name"], "info")
+    return r
+
+
+def op_project_delete(p, who):
+    r = dk.v_project_delete(ns(name=p.get("name")))
+    presence.event(who, "deleted project %s" % p.get("name"), "info")
+    return r
+
+
+def artifact_path(jid, rel):
+    base = os.path.realpath(dk.load(jid).get("artifact_dir") or "/nonexistent")
+    path = os.path.realpath(os.path.join(base, rel or ""))
+    if not path.startswith(base + os.sep) or not os.path.isfile(path):
+        raise dk.Fail("no such artifact: %s" % rel)
+    return path
+
+
+def op_read_artifact(p, who):
+    path = artifact_path(p.get("id"), p.get("path"))
+    if not path.endswith(TEXT_ARTIFACTS):
+        raise dk.Fail("only text artifacts can be read here (%s); download binaries over HTTP" % ", ".join(TEXT_ARTIFACTS))
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        data = f.read(READ_ARTIFACT_MAX)
+    return {"id": p.get("id"), "path": p.get("path"), "bytes": size, "truncated": size > READ_ARTIFACT_MAX,
+            "text": dk.redact(data.decode("utf-8", "replace"))}
+
+
+def op_hosts(p, who):
+    me = dk.v_ping(None)
+    return {"hosts": [dict({k: me.get(k) for k in ("name", "platform", "host", "macos", "chip", "xcode", "queue_len", "running", "kinds", "targets")},
+                           self=True, online=True, url=None)] + peers.status()}
+
+
+OPS = {
+    "ping": lambda p, w: dk.v_ping(None),
+    "kinds": lambda p, w: dk.v_kinds(None),
+    "devices": lambda p, w: dk.v_devices(None),
+    "simulators": lambda p, w: dk.v_simulators(None),
+    "signing": lambda p, w: dk.v_signing(None),
+    "device_apps": lambda p, w: dk.v_device_apps(ns(id=p.get("id"))),
+    "list": lambda p, w: dk.v_list(ns(limit=int(p.get("limit") or DEFAULT_LIMIT))),
+    "queue": op_queue,
+    "status": lambda p, w: dk.v_status(ns(id=p.get("id"))),
+    "log": lambda p, w: dk.v_log(ns(id=p.get("id"), tail=int(p["tail"]) if p.get("tail") else None)),
+    "cancel": op_cancel,
+    "artifacts": lambda p, w: dk.v_artifacts(ns(id=p.get("id"))),
+    "read_artifact": op_read_artifact,
+    "projects": lambda p, w: dk.v_projects(None),
+    "project_save": op_project_save,
+    "project_delete": op_project_delete,
+    "system": lambda p, w: {"info": system.info(), "settings": system.settings(load_config()),
+                            "metrics": metrics_history[-1] if metrics_history else system.metrics()},
+    "metrics": lambda p, w: {"history": list(metrics_history)},
+    "clients": lambda p, w: {"clients": presence.snapshot()},
+    "activity": lambda p, w: {"events": list(presence.activity)[: int(p.get("limit") or 100)]},
+    "hosts": op_hosts,
+}
+WRITE_OPS = ("queue", "cancel", "project_save", "project_delete")
+# MCP tool -> REST call on a peer, for tools called with a "host" argument
+REST = {"ping": ("GET", "/api/ping"), "system": ("GET", "/api/system"), "kinds": ("GET", "/api/kinds"),
+        "projects": ("GET", "/api/projects"), "devices": ("GET", "/api/devices"), "simulators": ("GET", "/api/simulators"),
+        "signing": ("GET", "/api/signing"), "device_apps": ("GET", "/api/devices/{id}/apps"), "list": ("GET", "/api/jobs"),
+        "status": ("GET", "/api/jobs/{id}"), "log": ("GET", "/api/jobs/{id}/log"), "artifacts": ("GET", "/api/jobs/{id}/artifacts"),
+        "cancel": ("POST", "/api/jobs/{id}/cancel"), "queue": ("POST", "/api/jobs")}
+
+S, I, O = {"type": "string"}, {"type": "integer"}, {"type": "object", "properties": {}}
+HOST = {"type": "string", "description": "Devkit host name from devkit_hosts; omit for this host. For queue, \"auto\" picks a host that runs the target's platform."}
+ID_ONLY = {"type": "object", "properties": {"id": S}, "required": ["id"]}
+MCP_TOOLS = [
+    ("hosts", "All connected devkit hosts (macOS, later Windows/Linux): platform, online, queue length, running job.", O),
+    ("ping", "Host health: name, platform, macOS, chip, Xcode, Unity editors, job kinds, queue length.", O),
+    ("system", "Hardware, installed Xcode/Unity/simulator runtimes, relevant settings (signing, sleep, firewall) and current load.", O),
+    ("kinds", "Describe every job kind and its params. Read this before queueing anything but echo.", O),
+    ("projects", "Saved projects (repo, branch, Xcode project, scheme, bundle id, default target/device). Prefer these values when queueing.", O),
+    ("devices", "Physical devices known to xcrun devicectl (ids for device).", O),
+    ("simulators", "Available simulators (ids for target ios-sim).", O),
+    ("device_apps", "Apps installed on a physical device (bundle ids for launch/profile).", ID_ONLY),
+    ("signing", "Code signing identities, provisioning profile count, App Store Connect / notary credentials configured.", O),
+    ("queue", "Queue a job (FIFO per host): build, test, archive, release (TestFlight / notarized macOS), deploy to an iPhone or "
+              "simulator, launch with arguments, profile with Instruments, screenshot, crashlogs, unity, or shell. commit may be a "
+              "SHA, branch or tag. The result names the host that runs it; pass that host to status/log/artifacts.",
+     {"type": "object", "properties": {"project": S, "repo": S, "commit": S, "kind": {"type": "string", "enum": list(dk.KINDS)},
+                                       "target": {"type": "string", "enum": list(dk.devkit_kinds.TARGETS)}, "device": S,
+                                       "args": S, "params": {"type": "object"}},
+      "required": ["project", "commit", "kind"]}),
+    ("list", "List recent jobs, newest first.", {"type": "object", "properties": {"limit": I}}),
+    ("status", "Job state (queued, running, succeeded, failed, cancelled) with per-step timing and, when failed, the plain-language error.", ID_ONLY),
+    ("log", "Job log text; tail = last N lines.", {"type": "object", "properties": {"id": S, "tail": I}, "required": ["id"]}),
+    ("cancel", "Cancel a queued or running devkit job.", ID_ONLY),
+    ("artifacts", "A job's files with sizes and sha256 (profile-summary.json holds the hottest functions of a profile). "
+                  "Read text files with devkit_read_artifact; download binaries via GET /api/jobs/<id>/artifacts/<path>.", ID_ONLY),
+    ("read_artifact", "Read a text artifact of a job (json, txt, log, xml, crash reports), up to 512 KB, e.g. profile-summary.json.",
+     {"type": "object", "properties": {"id": S, "path": S}, "required": ["id", "path"]}),
+]
+for _tool, _desc, _schema in MCP_TOOLS:
+    if _tool != "hosts":
+        _schema.setdefault("properties", {})["host"] = HOST
+
+
+def forward_tool(name, args, who):
+    host = args.pop("host", None)
+    if name == "queue" and host == "auto":
+        host = peers.route(args.get("target"), dict(dk.v_ping(None)))
+    if not host or host == self_name():
+        return OPS[name](args, who)
+    if name == "read_artifact":  # file contents come back raw over HTTP; wrap them like the local tool does
+        jid, rel = str(args.get("id", "")), str(args.get("path", ""))
+        if not rel.endswith(TEXT_ARTIFACTS):
+            raise dk.Fail("only text artifacts can be read here")
+        status, _, data = peers.call(peers.get(host), "GET", "/api/jobs/%s/artifacts/%s" % (
+            urllib.parse.quote(jid, safe=""), "/".join(urllib.parse.quote(x, safe="") for x in rel.split("/"))),
+            client="%s via %s" % (who, self_name()))
+        if status >= 400:
+            raise dk.Fail("%s: no such artifact: %s" % (host, rel))
+        return {"id": jid, "path": rel, "bytes": len(data), "truncated": len(data) > READ_ARTIFACT_MAX,
+                "text": data[:READ_ARTIFACT_MAX].decode("utf-8", "replace")}
+    method, path = REST[name]
+    path = path.format(id=urllib.parse.quote(str(args.pop("id", "")), safe=""))
+    query = {k: v for k, v in args.items() if k in ("limit", "tail") and v is not None} if method == "GET" else None
+    out = peers.call_json(peers.get(host), method, path, body=args if method == "POST" else None, query=query,
+                          client="%s via %s" % (who, self_name()))
+    if name == "queue":
+        out["host"] = host
+    return out
+
+
+def mcp(msg, who, role, key):
+    """Handle one JSON-RPC message; returns the response dict, or None for notifications."""
+    mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    if method == "initialize":
+        info = params.get("clientInfo") or {}
+        if info.get("name"):
+            mcp_names[key] = "%s %s" % (info["name"], info.get("version", "")).strip()
+    if mid is None:
+        return None
+    if method == "initialize":
+        result = {"protocolVersion": params.get("protocolVersion") or MCP_PROTOCOL,
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "devkit", "version": VERSION}}
+    elif method == "ping":
+        result = {}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "devkit_" + n, "description": d, "inputSchema": s} for n, d, s in MCP_TOOLS]}
+    elif method == "tools/call":
+        name = (params.get("name") or "").replace("devkit_", "", 1)
+        if name not in OPS:
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
+        try:
+            if name in WRITE_OPS and not auth.allows(role, "operator"):
+                raise dk.Fail("this token is read-only (viewer)")
+            out, err = forward_tool(name, dict(params.get("arguments") or {}), who), False
+        except ERRORS as e:
+            out, err = {"error": str(e)}, True
+        result = {"content": [{"type": "text", "text": json.dumps(out)}], "structuredContent": out, "isError": err}
+    else:
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}}
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def ua_label(ua):
+    for pat, name in ((r"Edg/", "Edge"), (r"Chrome/", "Chrome"), (r"Firefox/", "Firefox"), (r"Safari/", "Safari"),
+                      (r"^curl/", "curl"), (r"python", "Python"), (r"node", "Node")):
+        if re.search(pat, ua or "", re.I):
+            return name
+    return (ua or "unknown client").split("/")[0][:40]
+
+
+def needed_role(method, parts):
+    """Minimum role for an /api request (parts without the leading 'api')."""
+    head = parts[0] if parts else ""
+    if head == "tokens" or (head == "hosts" and method != "GET" and len(parts) <= 2):
+        return "admin"
+    if head == "hosts" and len(parts) > 2:  # forwarded to a peer: same rule as the forwarded path
+        return needed_role(method, parts[2:])
+    if head == "screen" or method != "GET":
+        return "operator"
+    return "viewer"
+
+
+# ---------------------------------------------------------------- HTTP
+class Handler(BaseHTTPRequestHandler):
+    server_version = "devkit/" + VERSION
+
+    def log_message(self, fmt, *args):
+        log.debug("%s %s", self.client_address[0], fmt % args)
+
+    def send(self, code, body, ctype="application/json", cache=False):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "max-age=300" if cache else "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def identify(self, channel):
+        ua = self.headers.get("User-Agent", "")
+        key = (self.client_address[0], ua)
+        return key, ua
+
+    def authorize(self, channel, action, need):
+        """Returns (label, role) for an allowed request; otherwise sends 401/403 and returns None."""
+        got = self.headers.get("Authorization", "")
+        ident = tokens.verify(got[7:] if got.startswith("Bearer ") else "")
+        if not ident:
+            log.warning("rejected unauthenticated request from %s to %s", self.client_address[0], self.path)
+            self.send(401, {"error": "unauthorized"})
+            return None
+        if not auth.allows(ident["role"], need):
+            self.send(403, {"error": "the token %r is %s; this needs %s" % (ident["name"], ident["role"], need)})
+            return None
+        key, ua = self.identify(channel)
+        named = ident["id"] != "owner"
+        label = self.headers.get("X-Devkit-Client") or mcp_names.get(key) or \
+            (ident["name"] if named else ("Web UI (%s)" % ua_label(ua) if channel == "web" else ua_label(ua)))
+        if named and ident["name"] not in label:
+            label = "%s (%s)" % (label, ident["name"])
+        label = label[:100]
+        presence.seen(self.client_address[0], label, ident["name"], ident["role"], channel, action)
+        self.ident = ident
+        return label, ident["role"]
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_BODY:
+            raise dk.Fail("request body too large")
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def static(self, rel):
+        path = os.path.realpath(os.path.join(WEB, rel))
+        ext = os.path.splitext(path)[1]
+        if not path.startswith(WEB + os.sep) or ext not in STATIC_TYPES or not os.path.isfile(path):
+            return self.send(404, {"error": "not found"})
+        with open(path, "rb") as f:
+            self.send(200, f.read(), STATIC_TYPES[ext], cache=ext in (".svg", ".png", ".ico"))
+
+    def channel(self):
+        return "web" if self.headers.get("X-Devkit-UI") else "peer" if self.headers.get(hosts.HOP_HEADER) else "api"
+
+    def route_api(self, method):
+        url = urllib.parse.urlsplit(self.path)
+        parts = [urllib.parse.unquote(p) for p in url.path.strip("/").split("/")]
+        if parts[:1] != ["api"]:
+            return self.send(404, {"error": "not found"})
+        parts = parts[1:]
+        quiet = parts[:1] in (["screen"], ["metrics"])
+        auth_ok = self.authorize(self.channel(), "watching" if quiet else "%s %s" % (method, url.path), needed_role(method, parts))
+        if not auth_ok:
+            return
+        who, role = auth_ok
+        q = {k: v[-1] for k, v in urllib.parse.parse_qs(url.query).items()}
+        try:
+            if parts[:1] == ["hosts"] and len(parts) > 2:
+                return self.forward(parts[1], method, "/api/" + "/".join(urllib.parse.quote(p, safe="") for p in parts[2:]), url.query, who)
+            body = self.body() if method in ("POST", "PUT") else {}
+            return self.dispatch(method, parts, q, body, who)
+        except ERRORS as e:
+            return self.send(400, {"error": str(e)})
+
+    def dispatch(self, method, parts, q, body, who):
+        n = len(parts)
+        if method == "GET":
+            if parts == ["screen"]:
+                return self.screen_frame(int(q.get("display") or 1))
+            if parts == ["me"]:
+                return self.send(200, {"name": self.ident["name"], "role": self.ident["role"], "label": who, "host": self_name()})
+            if parts == ["tokens"]:
+                return self.send(200, {"tokens": tokens.list()})
+            if n == 1 and parts[0] in OPS and parts[0] not in WRITE_OPS:
+                return self.send(200, OPS[parts[0]](q, who))
+            if parts[0] == "jobs" and n == 1:
+                return self.send(200, OPS["list"](q, who))
+            if parts[0] == "jobs" and n == 2:
+                return self.send(200, OPS["status"]({"id": parts[1]}, who))
+            if parts[0] == "jobs" and n == 3 and parts[2] in ("log", "artifacts"):
+                return self.send(200, OPS[parts[2]](dict(q, id=parts[1]), who))
+            if parts[0] == "jobs" and n >= 4 and parts[2] == "artifacts":
+                return self.artifact(parts[1], "/".join(parts[3:]))
+            if parts[0] == "devices" and n == 3 and parts[2] == "apps":
+                return self.send(200, OPS["device_apps"]({"id": parts[1]}, who))
+        elif method == "POST":
+            if parts == ["jobs"]:
+                host = body.pop("host", None)
+                if host == "auto":
+                    host = peers.route(body.get("target"), dict(dk.v_ping(None)))
+                if host and host != self_name():
+                    out = peers.call_json(peers.get(host), "POST", "/api/jobs", body, client="%s via %s" % (who, self_name()))
+                    peers.cache = (0, [])  # the next auto-routed job should see this host's longer queue
+                    presence.event(who, "sent %s %s to %s" % (body.get("kind"), body.get("project"), host), "queued")
+                    return self.send(201, dict(out, host=host))
+                return self.send(201, OPS["queue"](body, who))
+            if n == 3 and parts[0] == "jobs" and parts[2] == "cancel":
+                return self.send(200, OPS["cancel"]({"id": parts[1]}, who))
+            if parts == ["projects"]:
+                return self.send(200, OPS["project_save"](body, who))
+            if parts == ["tokens"]:
+                rec, plain = tokens.create(body.get("name"), body.get("role") or "operator", who)
+                presence.event(who, "created %s token %s" % (rec["role"], rec["name"]), "info")
+                return self.send(201, dict(rec, token=plain))
+            if parts == ["hosts"]:
+                h = peers.add(body.get("url") or "", body.get("token") or "")
+                presence.event(who, "connected host %s (%s)" % (h["name"], h.get("platform")), "connect")
+                return self.send(201, h)
+        elif method == "DELETE":
+            if n == 2 and parts[0] == "projects":
+                return self.send(200, OPS["project_delete"]({"name": parts[1]}, who))
+            if n == 2 and parts[0] == "tokens":
+                if parts[1] == "owner":
+                    raise dk.Fail("the owner token lives in config.json and cannot be revoked here")
+                tokens.revoke(parts[1])
+                presence.event(who, "revoked token %s" % parts[1], "info")
+                return self.send(200, {"revoked": parts[1]})
+            if n == 2 and parts[0] == "hosts":
+                peers.remove(parts[1])
+                presence.event(who, "disconnected host %s" % parts[1], "info")
+                return self.send(200, {"removed": parts[1]})
+        return self.send(404, {"error": "not found"})
+
+    def forward(self, host, method, path, query, who):
+        if self.headers.get(hosts.HOP_HEADER):
+            return self.send(400, {"error": "requests are forwarded at most one hop"})
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0)) if method in ("POST", "PUT") else None
+        status, ctype, data = peers.call(peers.get(host), method, path, body=body,
+                                         query=dict(urllib.parse.parse_qsl(query)) if query else None,
+                                         client="%s via %s" % (who, self_name()))
+        self.send(status, data, ctype)
+
+    def screen_frame(self, display):
+        try:
+            frame = screen.frame(display)
+        except PermissionError as e:
+            return self.send(503, {"error": "screen capture is not allowed for devkit-server: grant Screen Recording to python3 "
+                                            "in System Settings > Privacy & Security", "detail": str(e)})
+        if not frame:
+            return self.send(503, {"error": "no frame yet"})
+        self.send(200, frame, "image/jpeg")
+
+    def artifact(self, jid, rel):
+        try:
+            path = artifact_path(jid, rel)
+        except dk.Fail:
+            return self.send(404, {"error": "no such artifact"})
+        ctype = mimetypes.guess_type(path)[0] if path.endswith((".png", ".jpg", ".json", ".txt", ".xml")) else None
+        with open(path, "rb") as f:
+            self.send(200, f.read(), ctype or "application/octet-stream")
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path in ("/", "/index.html"):
+            return self.static("index.html")
+        if path.startswith("/assets/"):
+            return self.static(path[len("/assets/"):])
+        if path in ("/favicon.svg", "/favicon.ico", "/apple-touch-icon.png", "/manifest.webmanifest"):
+            return self.static({"/favicon.ico": "icon.svg", "/favicon.svg": "icon.svg"}.get(path, path[1:]))
+        if path == "/mcp":
+            return self.send(405, {"error": "use POST for MCP"})
+        self.route_api("GET")
+
+    def do_POST(self):
+        if urllib.parse.urlsplit(self.path).path.rstrip("/") != "/mcp":
+            return self.route_api("POST")
+        auth_ok = self.authorize("mcp", "MCP", "viewer")
+        if not auth_ok:
+            return
+        who, role = auth_ok
+        try:
+            msg = self.body()
+            key, _ = self.identify("mcp")
+            out = [r for r in (mcp(m, who, role, key) for m in msg) if r] if isinstance(msg, list) else mcp(msg, who, role, key)
+            return self.send(200, out) if out else self.send(202, b"", "text/plain")
+        except ERRORS as e:
+            return self.send(400, {"error": str(e)})
+
+    def do_DELETE(self):
+        self.route_api("DELETE")
+
+
+def main():
+    global tokens
+    logging.basicConfig(level=os.environ.get("DEVKIT_LOG_LEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    cfg = load_config()
+    for d in (dk.JOBS, os.path.dirname(ACTIVITY_LOG)):
+        os.makedirs(d, exist_ok=True)
+    tokens = auth.TokenStore(TOKENS, cfg["token"])
+    peers.self_name = self_name()
+    port = int(os.environ.get("DEVKIT_PORT") or cfg.get("port", DEFAULT_PORT))
+    srv = ThreadingHTTPServer((cfg.get("bind", "0.0.0.0"), port), Handler)
+    srv.daemon_threads = True
+    for fn in (watch_jobs, sample_metrics):
+        threading.Thread(target=fn, daemon=True).start()
+    presence.event("devkit", "server started", "info")
+    log.info("%s listening on %s:%s (UI /, API /api, MCP /mcp)", peers.self_name, *srv.server_address[:2])
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

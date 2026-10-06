@@ -1,0 +1,21 @@
+#!/bin/sh
+# Installs (or reinstalls) the devkit server as a LaunchAgent for the current user, so it starts at login.
+# Usage: bin/install-launchagent [--uninstall]
+set -eu
+
+LABEL="dev.devkit.server"
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+if [ "${1:-}" = "--uninstall" ]; then
+  rm -f "$PLIST"
+  echo "Removed $LABEL."
+  exit 0
+fi
+
+mkdir -p "$DIR/logs" "$HOME/Library/LaunchAgents"
+sed "s|@DEVKIT_DIR@|$DIR|g" "$DIR/launchd/$LABEL.plist.in" > "$PLIST"
+launchctl bootstrap "$DOMAIN" "$PLIST"
+echo "Installed $LABEL from $DIR; log: $DIR/logs/server.log"

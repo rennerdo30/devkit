@@ -1,0 +1,547 @@
+#!/usr/bin/python3
+"""devkit: single-queue Xcode/Unity job runner. Every verb prints one JSON object."""
+import argparse, fcntl, hashlib, json, os, platform, re, signal, subprocess, sys, time, uuid
+
+CODE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+ROOT = os.path.realpath(os.environ.get("DEVKIT_DATA") or CODE)  # data dir; a second instance can use its own
+sys.path.insert(0, os.path.join(CODE, "lib"))
+import devkit_hosts, devkit_kinds  # noqa: E402
+
+JOBS, WORK, ARTIFACTS, DERIVED = (os.path.join(ROOT, d) for d in ("jobs", "work", "artifacts", "derived"))
+CONFIG = os.path.join(ROOT, "config.json")
+LOCK = os.path.join(ROOT, "worker.lock")
+KINDS = tuple(sorted(devkit_kinds.KINDS))
+NO_CHECKOUT_KINDS = ("echo", "screenshot", "crashlogs", "launch")
+UNITY_EDITORS = devkit_kinds.UNITY_EDITORS
+PROFILES_DIR = os.path.expanduser("~/Library/Developer/Xcode/UserData/Provisioning Profiles")
+DEFAULT_STEP_TIMEOUT = 3 * 3600
+DISPLAY_KINDS = ("launch", "profile", "screenshot", "deploy", "test")  # simulator / Instruments need the display awake
+BUNDLE_SUFFIXES = (".app", ".trace", ".xcresult", ".xcarchive", ".dSYM")
+SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+REF_NAME = re.compile(r"^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$")  # commit SHA, branch or tag
+PROJECTS = os.path.join(ROOT, "projects.json")
+PROJECT_FIELDS = ("name", "repo", "ref", "xcode", "scheme", "bundle_id", "team_id", "target", "device", "unity_build_target",
+                  "unity_method", "notes")
+SECRET = re.compile(r"(?i)((?:token|password|passwd|secret|api[_-]?key)[=:]\s*)\S+|(://)[^/@\s]+@")
+SECRET_FLAGS = ("-authenticationKeyPath", "-authenticationKeyID", "-authenticationKeyIssuerID", "--keychain-profile", "--password")
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "/usr/bin:/bin")
+
+
+class Fail(Exception):
+    pass
+
+
+class Cancelled(Exception):
+    pass
+
+
+def redact(s):
+    return SECRET.sub(lambda m: m.group(1) + "***" if m.group(1) else "://***@", s)
+
+
+def redact_cmd(cmd):
+    return " ".join("***" if i and cmd[i - 1] in SECRET_FLAGS else c for i, c in enumerate(cmd))
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def jdir(jid):
+    if not SAFE_NAME.match(jid or ""):
+        raise Fail("invalid job id")
+    d = os.path.join(JOBS, jid)
+    if not os.path.isdir(d):
+        raise Fail("no such job: " + jid)
+    return d
+
+
+def load(jid):
+    with open(os.path.join(jdir(jid), "state.json")) as f:
+        return json.load(f)
+
+
+def save(st):
+    p = os.path.join(JOBS, st["id"], "state.json")
+    with open(p + ".tmp", "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(p + ".tmp", p)
+
+
+def all_jobs():
+    out = []
+    for jid in os.listdir(JOBS):
+        try:
+            out.append(load(jid))
+        except (Fail, OSError, ValueError):
+            pass
+    return sorted(out, key=lambda s: s["seq"])
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
+
+
+def step_label(cmd):
+    """Short human label for a command, e.g. 'xcodebuild archive', 'devicectl install app', 'xctrace record'."""
+    a = [os.path.basename(cmd[0])] + list(cmd[1:])
+    if a[0] == "xcrun" and len(a) > 1:
+        a = a[1:]
+    if a[0] == "xcodebuild":
+        verb = next((x for x in a if x in ("build", "test", "archive")), "export" if "-exportArchive" in a else "")
+    else:
+        verb = " ".join(x for x in a[1:4] if re.match(r"^[a-z]+$", x))
+    return (a[0] + " " + verb).strip()
+
+
+# ---------------------------------------------------------------- job context handed to kinds
+class Ctx:
+    Fail = Fail
+
+    def __init__(self, st, logf, art):
+        self.st, self.logf, self.art = st, logf, art
+        self.p = dict(st.get("params") or {})
+        self.target, self.device, self.args = st.get("target"), st.get("device"), st.get("args") or ""
+        self.work = os.path.join(WORK, st["project"])
+        self.derived = os.path.join(DERIVED, st["project"])
+        self.cfg = config()
+        self.cancel_file = os.path.join(JOBS, st["id"], "cancel")
+
+    def log(self, msg):
+        self.logf.write(redact(msg.rstrip("\n")) + "\n")
+
+    def write(self, name, text):
+        with open(os.path.join(self.art, name), "w") as f:
+            f.write(redact(text))
+
+    @staticmethod
+    def json(obj):
+        return json.dumps(obj)
+
+    @staticmethod
+    def json_load(f):
+        return json.load(f)
+
+    def auth_args(self):
+        key = self.cfg.get("asc_api_key") or {}
+        args = ["-allowProvisioningUpdates"]
+        if key.get("key_path"):
+            args += ["-authenticationKeyPath", os.path.expanduser(key["key_path"]),
+                     "-authenticationKeyID", key["key_id"], "-authenticationKeyIssuerID", key["issuer_id"]]
+        return args
+
+    def run(self, cmd, cwd=None, env=None, check=True, timeout=None, timeout_ok=False, log_cmd=True, out=None):
+        """Run one step in its own process group, streaming output to the job log; out (a list) also collects it."""
+        if os.path.exists(self.cancel_file):
+            raise Cancelled()
+        if log_cmd:
+            self.log("$ " + redact_cmd(cmd))
+        step = {"label": step_label(cmd) if log_cmd else "shell", "started": time.time(), "finished": None, "exit": None,
+                "expected_seconds": timeout if timeout_ok else None}
+        self.st.setdefault("steps", []).append(step)
+        full_env = dict(os.environ, DEVKIT_JOB=self.st["id"], DEVKIT_ARTIFACTS=self.art, DEVKIT_MUTE="1", **(env or {}))
+        p = subprocess.Popen(cmd, cwd=cwd or (self.work if os.path.isdir(self.work) else self.art), env=full_env,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             errors="replace", start_new_session=True)
+        self.st["pid"] = p.pid
+        save(self.st)
+        limit = timeout or DEFAULT_STEP_TIMEOUT
+        deadline = time.time() + limit
+        timed_out = False
+        os.set_blocking(p.stdout.fileno(), False)
+        while True:
+            line = p.stdout.readline()
+            if line:
+                self.logf.write(redact(line))
+                out is not None and out.append(line)
+                continue
+            if p.poll() is not None:
+                break
+            if time.time() > deadline:
+                timed_out = True
+                os.killpg(p.pid, signal.SIGTERM)
+                p.wait(timeout=30)
+                break
+            time.sleep(0.2)
+        os.set_blocking(p.stdout.fileno(), True)
+        for line in p.stdout:
+            self.logf.write(redact(line))
+            out is not None and out.append(line)
+        self.st["pid"] = None
+        step.update(finished=time.time(), exit=p.returncode)
+        save(self.st)
+        if os.path.exists(self.cancel_file):
+            raise Cancelled()
+        if timed_out:
+            self.log("DEVKIT step stopped after %ss" % limit)
+            if timeout_ok:
+                return 0
+            raise Fail("step timed out: " + os.path.basename(cmd[0]))
+        if check and p.returncode:
+            raise Fail("step failed with exit %s: %s" % (p.returncode, os.path.basename(cmd[0])))
+        return p.returncode
+
+
+# ---------------------------------------------------------------- worker
+def worker():
+    lockf = open(LOCK, "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # another worker is already draining the queue
+    while True:
+        queued = [s for s in all_jobs() if s["state"] == "queued"]
+        if not queued:
+            return
+        execute(queued[0])
+
+
+def execute(st):
+    d = os.path.join(JOBS, st["id"])
+    art = os.path.join(ARTIFACTS, st["project"], st["commit"].replace("/", "_"), st["id"])
+    os.makedirs(art, exist_ok=True)
+    st.update(state="running", started=now(), artifact_dir=art)
+    save(st)
+    awake = keep_awake(st["kind"])
+    state, code = "failed", 1
+    with open(os.path.join(d, "log.txt"), "w", buffering=1) as log:
+        log.write("DEVKIT commit=%s project=%s kind=%s target=%s\n" % (st["commit"], st["project"], st["kind"], st["target"] or ""))
+        ctx = Ctx(st, log, art)
+        try:
+            if st["repo"] and st["kind"] not in NO_CHECKOUT_KINDS:
+                st["resolved"] = checkout(st, log)
+                save(st)
+            os.makedirs(ctx.derived, exist_ok=True)
+            devkit_kinds.KINDS[st["kind"]](ctx)
+            zip_bundles(ctx)
+            state, code = "succeeded", 0
+        except Cancelled:
+            state, code = "cancelled", -signal.SIGTERM
+        except Exception as e:  # any job failure goes to its log; the worker keeps draining
+            log.write("DEVKIT error: %s\n" % redact(str(e)))
+        log.write("DEVKIT state=%s\n" % state)
+    if awake:
+        awake.terminate()
+    if state == "failed":
+        st["error"] = failure_reason(os.path.join(d, "log.txt"))
+    st.update(state=state, exit_code=code, finished=now(), pid=None)
+    save(st)
+
+
+def keep_awake(kind):
+    """Hold a no-sleep assertion while this job runs; it also ends on its own if the worker dies (-w)."""
+    flags = "-ims" + ("d" if kind in DISPLAY_KINDS else "")
+    try:
+        return subprocess.Popen(["caffeinate", flags, "-w", str(os.getpid())], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None  # not on macOS, or caffeinate missing: jobs still run
+
+
+def zip_bundles(ctx):
+    """Directory bundles (.trace, .xcresult, .app, ...) also get a .zip so remote clients can download one file."""
+    for name in sorted(os.listdir(ctx.art)):
+        path = os.path.join(ctx.art, name)
+        if os.path.isdir(path) and name.endswith(BUNDLE_SUFFIXES) and not os.path.exists(path + ".zip"):
+            ctx.run(["ditto", "-c", "-k", "--keepParent", path, path + ".zip"])
+
+
+FAILURE_PATTERNS = (
+    re.compile(r"NSLocalizedFailureReason = (.+)"),
+    re.compile(r"NSLocalizedRecoverySuggestion = (.+)"),
+    re.compile(r"xcodebuild: error: (.+)"),
+    re.compile(r"^.*?: error: (.+?)(?: \(in target .*)?$"),
+    re.compile(r"^ERROR: (.+)$"),
+    re.compile(r"^fatal: (.+)$"),
+    re.compile(r"^DEVKIT error: (.+)$"),
+)
+FAILURE_MAX_PARTS = 2
+
+
+def failure_reason(log_path):
+    """The most specific human-readable cause of a failed job, taken from its log."""
+    try:
+        with open(log_path, errors="replace") as f:
+            lines = [l.strip() for l in f.readlines()[-400:]]
+    except OSError:
+        return None
+    for pat in FAILURE_PATTERNS:
+        found = []
+        for line in lines:
+            m = pat.search(line)
+            if m and m.group(1).strip() not in found:
+                found.append(m.group(1).strip())
+        if found and pat is FAILURE_PATTERNS[-1]:  # generic step failure: the tool's own last words say more
+            i = max(i for i, l in enumerate(lines) if l.startswith("DEVKIT error"))
+            before = [l for l in lines[:i] if l and not l.startswith(("$ ", "DEVKIT"))]
+            if before:
+                found.insert(0, before[-1])
+        if found:
+            if pat.pattern.startswith("NSLocalizedFailureReason"):  # pair the reason with Apple's suggested fix
+                tip = [m.group(1).strip() for m in map(FAILURE_PATTERNS[1].search, lines) if m]
+                found += tip[:1]
+            return redact(" ".join(p if p.endswith((".", "!", "?")) else p + "." for p in found[:FAILURE_MAX_PARTS]))[:400]
+    return None
+
+
+def checkout(st, log):
+    w = os.path.join(WORK, st["project"])
+
+    def git(*a, check=True):
+        return subprocess.run(["git", "-C", w] + list(a), stdin=subprocess.DEVNULL, stdout=log,
+                              stderr=subprocess.STDOUT, check=check, timeout=3600).returncode
+
+    if not os.path.isdir(os.path.join(w, ".git")):
+        os.makedirs(w, exist_ok=True)
+        git("init", "-q")
+    subprocess.run(["git", "-C", w, "remote", "remove", "origin"], capture_output=True)
+    git("remote", "add", "origin", st["repo"])
+    if git("fetch", "-q", "--depth", "1", "origin", st["commit"], check=False) == 0:
+        rev = "FETCH_HEAD"  # branch, tag or full SHA
+    else:
+        git("fetch", "-q", "origin")  # servers that refuse fetching a bare or abbreviated SHA
+        rev = st["commit"]
+    git("-c", "advice.detachedHead=false", "checkout", "-q", "--force", rev)
+    git("clean", "-q", "-fdx", "-e", "Library/")  # keep Unity's import cache between builds
+    sha = run(["git", "-C", w, "rev-parse", "HEAD"])
+    log.write("DEVKIT checked out %s\n" % sha)
+    return sha
+
+
+# ---------------------------------------------------------------- verbs
+STATIC_TTL = 60
+_static = {}
+
+
+def static_info():
+    """Facts that rarely change (chip, Xcode, Unity editors), refreshed at most once a minute."""
+    if time.time() - _static.get("at", 0) > STATIC_TTL:
+        _static.update(at=time.time(), chip=run(["sysctl", "-n", "machdep.cpu.brand_string"]),
+                       xcode=run(["xcodebuild", "-version"]).replace("\n", " "),
+                       unity=sorted(os.listdir(UNITY_EDITORS)) if os.path.isdir(UNITY_EDITORS) else [])
+    return _static
+
+
+def v_ping(a):
+    info = static_info()
+    jobs = all_jobs()
+    cur = next((j for j in jobs if j["state"] == "running"), None)
+    return {"ok": True, "name": config().get("name") or platform.node().split(".")[0], "platform": devkit_hosts.PLATFORM,
+            "host": platform.node(), "macos": platform.mac_ver()[0],
+            "running": {k: cur.get(k) for k in ("id", "kind", "project", "target", "started", "requested_by")} if cur else None,
+            "chip": info["chip"], "xcode": info["xcode"], "unity_editors": info["unity"],
+            "kinds": list(KINDS), "targets": list(devkit_kinds.TARGETS),
+            "queue_len": sum(s["state"] in ("queued", "running") for s in jobs)}
+
+
+def v_kinds(a):
+    return {"kinds": {k: (fn.__doc__ or "").strip() for k, fn in sorted(devkit_kinds.KINDS.items())},
+            "params": devkit_kinds.__doc__.strip(), "targets": list(devkit_kinds.TARGETS)}
+
+
+def v_queue(a):
+    if not SAFE_NAME.match(a.project or ""):
+        raise Fail("invalid --project")
+    if not REF_NAME.match(a.commit or ""):
+        raise Fail("invalid --commit (use a SHA, branch or tag)")
+    if a.kind not in KINDS:
+        raise Fail("unknown kind %r, supported: %s" % (a.kind, ", ".join(KINDS)))
+    if a.target and a.target not in devkit_kinds.TARGETS:
+        raise Fail("unknown target %r, supported: %s" % (a.target, ", ".join(devkit_kinds.TARGETS)))
+    params = json.loads(a.params) if isinstance(a.params, str) else (a.params or {})
+    if not isinstance(params, dict):
+        raise Fail("params must be a JSON object")
+    jobs = all_jobs()
+    jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+    os.makedirs(os.path.join(JOBS, jid))
+    save({"id": jid, "seq": (jobs[-1]["seq"] + 1) if jobs else 1, "project": a.project, "repo": a.repo or "",
+          "commit": a.commit, "kind": a.kind, "target": a.target, "device": a.device, "args": a.args or "",
+          "params": params, "requested_by": getattr(a, "by", None) or "cli", "state": "queued", "created": now(), "pid": None, "started": None, "finished": None,
+          "exit_code": None, "artifact_dir": None})
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "_worker"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return {"id": jid, "state": "queued", "position": sum(s["state"] == "queued" for s in jobs) + 1}
+
+
+def public(st):
+    keys = ("id", "project", "repo", "commit", "resolved", "requested_by", "steps", "error", "kind", "target", "device", "args", "params", "state", "pid", "created",
+            "started", "finished", "exit_code", "artifact_dir")
+    out = {k: st.get(k) for k in keys}
+    out["repo"] = redact(out["repo"] or "")
+    return out
+
+
+def v_status(a):
+    return public(load(a.id))
+
+
+def v_list(a):
+    return {"jobs": [public(s) for s in reversed(all_jobs())][: a.limit]}
+
+
+def v_log(a):
+    p = os.path.join(jdir(a.id), "log.txt")
+    lines = open(p, errors="replace").readlines() if os.path.exists(p) else []
+    return {"id": a.id, "text": "".join(lines[-a.tail:] if a.tail else lines)}
+
+
+def v_cancel(a):
+    st = load(a.id)
+    if st["state"] not in ("queued", "running"):
+        raise Fail("job is %s, nothing to cancel" % st["state"])
+    open(os.path.join(jdir(a.id), "cancel"), "w").close()
+    if st["state"] == "queued":
+        st.update(state="cancelled", finished=now())
+        save(st)
+        return {"id": a.id, "state": "cancelled"}
+    if st.get("pid"):
+        try:
+            os.killpg(st["pid"], signal.SIGTERM)  # the current step's own process group only (start_new_session)
+        except ProcessLookupError:
+            pass
+    return {"id": a.id, "state": "cancelling"}
+
+
+def v_devices(a):
+    out = os.path.join(ROOT, "devices.json")
+    subprocess.run(["xcrun", "devicectl", "list", "devices", "--json-output", out], capture_output=True, timeout=60, check=True)
+    with open(out) as f:
+        devs = json.load(f)["result"]["devices"]
+    return {"devices": [{"id": d.get("hardwareProperties", {}).get("udid") or d.get("identifier"),
+                         "name": d.get("deviceProperties", {}).get("name"),
+                         "model": d.get("hardwareProperties", {}).get("marketingName"),
+                         "os": d.get("deviceProperties", {}).get("osVersionNumber"),
+                         "connection": d.get("connectionProperties", {}).get("tunnelState")}
+                        for d in devs if d.get("hardwareProperties", {}).get("reality", "physical") == "physical"]}
+
+
+def v_simulators(a):
+    data = json.loads(subprocess.run(["xcrun", "simctl", "list", "devices", "available", "--json"],
+                                     capture_output=True, text=True, timeout=60, check=True).stdout)
+    return {"simulators": [{"id": d["udid"], "name": d["name"], "runtime": rt.rsplit(".", 1)[-1], "state": d["state"]}
+                           for rt, devs in data["devices"].items() for d in devs]}
+
+
+def v_signing(a):
+    out = run(["security", "find-identity", "-v", "-p", "codesigning"])
+    cfg = config()
+    return {"identities": re.findall(r'"([^"]+)"', out),
+            "provisioning_profiles": len(os.listdir(PROFILES_DIR)) if os.path.isdir(PROFILES_DIR) else 0,
+            "asc_api_key": bool((cfg.get("asc_api_key") or {}).get("key_path")),
+            "notary_profile": bool(cfg.get("notary_profile"))}
+
+
+def read_projects():
+    try:
+        with open(PROJECTS) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def v_projects(a):
+    return {"projects": sorted(read_projects().values(), key=lambda p: p["name"].lower())}
+
+
+def v_project_save(a):
+    p = {k: str(v).strip() for k, v in (a.project or {}).items() if k in PROJECT_FIELDS and v not in (None, "")}
+    if not SAFE_NAME.match(p.get("name", "")):
+        raise Fail("project name may only contain letters, digits, dot, dash and underscore")
+    if p.get("ref") and not REF_NAME.match(p["ref"]):
+        raise Fail("invalid branch, tag or commit")
+    with open(LOCK + ".projects", "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        allp = read_projects()
+        if a.previous and a.previous != p["name"]:
+            allp.pop(a.previous, None)
+        allp[p["name"]] = p
+        with open(PROJECTS + ".tmp", "w") as f:
+            json.dump(allp, f, indent=1)
+        os.replace(PROJECTS + ".tmp", PROJECTS)
+    return {"project": p}
+
+
+def v_project_delete(a):
+    with open(LOCK + ".projects", "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        allp = read_projects()
+        if allp.pop(a.name, None) is None:
+            raise Fail("no such project: %s" % a.name)
+        with open(PROJECTS + ".tmp", "w") as f:
+            json.dump(allp, f, indent=1)
+        os.replace(PROJECTS + ".tmp", PROJECTS)
+    return {"deleted": a.name}
+
+
+def v_device_apps(a):
+    """User-installed apps on a physical device (bundle id, name, version)."""
+    out = os.path.join(ROOT, "apps-%s.json" % uuid.uuid4().hex[:6])
+    try:
+        subprocess.run(["xcrun", "devicectl", "device", "info", "apps", "--device", a.id, "--json-output", out],
+                       capture_output=True, timeout=90, check=True)
+        with open(out) as f:
+            apps = json.load(f).get("result", {}).get("apps", [])
+    finally:
+        if os.path.exists(out):
+            os.remove(out)
+    return {"apps": sorted(({"bundle_id": x.get("bundleIdentifier"), "name": x.get("name"), "version": x.get("version")}
+                            for x in apps if not x.get("hidden")),
+                           key=lambda x: (x["name"] or "").lower())}
+
+
+def v_artifacts(a):
+    d, files = load(a.id).get("artifact_dir"), []
+    for base, dirs, names in os.walk(d) if d else []:
+        dirs[:] = [x for x in dirs if not x.endswith(BUNDLE_SUFFIXES)]  # bundles are listed via their .zip
+        for n in sorted(names):
+            p = os.path.join(base, n)
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            files.append({"path": os.path.relpath(p, d), "bytes": os.path.getsize(p), "sha256": h.hexdigest()})
+    return {"id": a.id, "dir": d, "files": files}
+
+
+def main():
+    os.makedirs(JOBS, exist_ok=True)
+    if sys.argv[1:] == ["_worker"]:
+        return worker()
+    ap = argparse.ArgumentParser(prog="devkit")
+    sub = ap.add_subparsers(dest="verb", required=True)
+    for v in ("ping", "kinds", "devices", "simulators", "signing"):
+        sub.add_parser(v)
+    q = sub.add_parser("queue")
+    for opt in ("project", "commit", "kind"):
+        q.add_argument("--" + opt, required=True)
+    for opt in ("repo", "target", "device", "args", "params", "by"):
+        q.add_argument("--" + opt)
+    for v in ("status", "cancel", "artifacts"):
+        sub.add_parser(v).add_argument("id")
+    sub.add_parser("list").add_argument("--limit", type=int, default=20)
+    lg = sub.add_parser("log")
+    lg.add_argument("id")
+    lg.add_argument("--tail", type=int)
+    try:
+        a = ap.parse_args()
+    except SystemExit as e:
+        print(json.dumps({"error": "bad arguments"}))
+        return e.code or 2
+    try:
+        print(json.dumps(globals()["v_" + a.verb](a)))
+        return 0
+    except (Fail, OSError, ValueError, subprocess.SubprocessError) as e:
+        print(json.dumps({"error": str(e)}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

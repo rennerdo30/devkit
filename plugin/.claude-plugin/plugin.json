@@ -1,0 +1,8 @@
+{
+  "name": "devkit",
+  "version": "0.1.0",
+  "description": "Build, install, launch, profile and release apps and games on remote devkit hosts (macOS now; Windows and Linux later) through the devkit MCP server.",
+  "author": { "name": "rennerdo30" },
+  "repository": "https://github.com/rennerdo30/devkit",
+  "keywords": ["xcode", "ios", "unity", "instruments", "build", "mcp"]
+}

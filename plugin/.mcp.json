@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "devkit": {
+      "type": "http",
+      "url": "${DEVKIT_URL:-http://localhost:7420}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${DEVKIT_TOKEN}"
+      }
+    }
+  }
+}

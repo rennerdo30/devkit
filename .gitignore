@@ -1,0 +1,21 @@
+# secrets
+config.json
+tokens.json
+*.p8
+
+# runtime data
+projects.json
+jobs/
+work/
+artifacts/
+derived/
+logs/
+worker.lock*
+devices.json
+apps-*.json
+*.tmp
+
+# tooling
+__pycache__/
+*.pyc
+.DS_Store

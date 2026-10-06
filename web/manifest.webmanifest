@@ -1,0 +1,12 @@
+{
+  "name": "Mac Devkit",
+  "short_name": "Devkit",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#e7eaee",
+  "theme_color": "#17202b",
+  "icons": [
+    { "src": "/assets/icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

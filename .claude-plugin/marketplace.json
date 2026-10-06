@@ -1,0 +1,12 @@
+{
+  "name": "devkit",
+  "description": "Claude Code plugin for devkit, a remote build, deploy and profiling host.",
+  "owner": { "name": "rennerdo30" },
+  "plugins": [
+    {
+      "name": "devkit",
+      "source": "./plugin",
+      "description": "Devkit MCP server connection plus skills for building, installing, profiling and releasing on devkit hosts."
+    }
+  ]
+}

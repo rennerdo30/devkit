@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Devkit</title>
+<meta name="theme-color" content="#17202b">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<section id="connect" class="connect panel hidden" aria-labelledby="connect-title">
+  <img src="/assets/icon.svg" alt="">
+  <h1 id="connect-title" data-t="connectTitle"></h1>
+  <p data-t="connectText"></p>
+  <form id="connect-form">
+    <div class="field"><label for="token-input" data-t="token"></label><input id="token-input" type="password" autocomplete="current-password" required></div>
+    <p id="connect-err" class="err" role="alert"></p>
+    <button class="btn primary" data-t="connect"></button>
+  </form>
+</section>
+
+<div id="frame" class="frame hidden">
+  <nav class="nav" aria-label="Main">
+    <a class="brand" href="#/"><img src="/assets/icon.svg" alt=""><div><b>Devkit</b><span><i id="host-dot" class="dot"></i><span id="host-name"></span></span></div></a>
+    <div id="nav-items"></div>
+    <div class="spacer"></div>
+    <a id="running-pill" class="running-pill hidden" href="#/"></a>
+  </nav>
+  <main id="main" class="main" tabindex="-1"></main>
+</div>
+
+<dialog id="dlg"></dialog>
+<script src="/assets/app.js"></script>
+</body>
+</html>
