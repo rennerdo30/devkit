@@ -13,6 +13,7 @@ WEB = os.path.join(CODE, "web")
 DEFAULT_PORT = 7420
 DEFAULT_LIMIT = 20
 MAX_BODY = 1 << 20
+STREAM_CHUNK = 1 << 20
 MCP_PROTOCOL = "2025-06-18"
 VERSION = "0.5.0"
 CLIENT_ACTIVE_SECONDS = 60
@@ -504,10 +505,36 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get(hosts.HOP_HEADER):
             return self.send(400, {"error": "requests are forwarded at most one hop"})
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)) if method in ("POST", "PUT") else None
+        if method == "GET" and re.fullmatch(r"/api/jobs/[^/]+/artifacts/.+", path):
+            with peers.open(peers.get(host), method, path,
+                            query=dict(urllib.parse.parse_qsl(query)) if query else None,
+                            client="%s via %s" % (who, self_name()), range_header=self.headers.get("Range")) as r:
+                try:
+                    self.send_response(r.status)
+                    for key in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"):
+                        value = r.headers.get(key)
+                        if value is not None:
+                            self.send_header(key, value)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    self.copy_stream(r)
+                except (BrokenPipeError, ConnectionResetError):
+                    log.debug("artifact client disconnected: %s", self.path)
+            return
         status, ctype, data = peers.call(peers.get(host), method, path, body=body,
                                          query=dict(urllib.parse.parse_qsl(query)) if query else None,
                                          client="%s via %s" % (who, self_name()))
         self.send(status, data, ctype)
+
+    def copy_stream(self, source, remaining=None):
+        while remaining is None or remaining > 0:
+            chunk = source.read(STREAM_CHUNK if remaining is None else min(STREAM_CHUNK, remaining))
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
 
     def screen_frame(self, display):
         try:
@@ -525,8 +552,44 @@ class Handler(BaseHTTPRequestHandler):
         except dk.Fail:
             return self.send(404, {"error": "no such artifact"})
         ctype = mimetypes.guess_type(path)[0] if path.endswith((".png", ".jpg", ".json", ".txt", ".xml")) else None
+        ctype = ctype or "application/octet-stream"
+        size, start, status = os.path.getsize(path), 0, 200
+        end = size - 1
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if match and any(match.groups()):
+            first, last = match.groups()
+            if first:
+                start = int(first)
+                end = min(int(last), size - 1) if last else size - 1
+            else:
+                start = max(0, size - int(last))
+            status = 416 if start > end or (not first and int(last) == 0) else 206
         with open(path, "rb") as f:
-            self.send(200, f.read(), ctype or "application/octet-stream")
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(0 if status == 416 else end - start + 1))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Accept-Ranges", "bytes")
+                if status != 200:
+                    self.send_header("Content-Range", "bytes */%s" % size if status == 416 else "bytes %s-%s/%s" % (start, end, size))
+                if ctype == "application/octet-stream":
+                    basename = os.path.basename(path)
+                    try:
+                        basename.encode("latin-1")
+                        name, extra = basename, ""
+                    except UnicodeEncodeError:
+                        name = basename.encode("ascii", "replace").decode("ascii")
+                        extra = "; filename*=UTF-8''" + urllib.parse.quote(basename, safe="")
+                    name = name.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+                    self.send_header("Content-Disposition", 'attachment; filename="%s"%s' % (name, extra))
+                self.end_headers()
+                if status != 416:
+                    f.seek(start)
+                    self.copy_stream(f, end - start + 1)
+            except (BrokenPipeError, ConnectionResetError):
+                log.debug("artifact client disconnected: %s", self.path)
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path

@@ -32,16 +32,25 @@ class Peers:
 
     def call(self, peer, method, path, body=None, query=None, timeout=CALL_TIMEOUT, client="devkit"):
         """Forward one request; returns (status, content_type, bytes)."""
+        try:
+            with self.open(peer, method, path, body, query, timeout, client) as r:
+                return r.status, r.headers.get("Content-Type", "application/json"), r.read()
+        except (urllib.error.URLError, OSError) as e:
+            raise PeerError("%s is not reachable: %s" % (peer["name"], getattr(e, "reason", e)))
+
+    def open(self, peer, method, path, body=None, query=None, timeout=CALL_TIMEOUT, client="devkit", range_header=None):
+        """Forward one request; caller closes the response."""
         url = peer["url"].rstrip("/") + path + ("?" + urllib.parse.urlencode(query) if query else "")
         data = body if isinstance(body, (bytes, type(None))) else json.dumps(body).encode()
         req = urllib.request.Request(url, data=data, method=method, headers={
             "Authorization": "Bearer " + peer["token"], "Content-Type": "application/json", HOP_HEADER: "1",
             "X-Devkit-Client": client})
+        if range_header is not None:
+            req.add_header("Range", range_header)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, r.headers.get("Content-Type", "application/json"), r.read()
+            return urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
-            return e.code, e.headers.get("Content-Type", "application/json"), e.read()
+            return e
         except (urllib.error.URLError, OSError) as e:
             raise PeerError("%s is not reachable: %s" % (peer["name"], getattr(e, "reason", e)))
 
