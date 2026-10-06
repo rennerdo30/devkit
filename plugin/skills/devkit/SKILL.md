@@ -4,6 +4,10 @@ description: Run builds, installs, launches, Instruments profiling, tests, scree
 
 # Working with devkit
 
+Use only the `devkit_*` MCP tools. If they are not available, the plugin is not connected: do not fall back to curl,
+Bash or the HTTP API. Tell the user to run `/plugin configure devkit@devkit` (devkit address and token), then `/mcp`
+to reconnect, and stop there.
+
 Devkit hosts run jobs one at a time per host, in order. You talk to them through the `devkit_*` MCP tools of the
 `devkit` server. One server can forward to every connected host, so `host` is just a parameter.
 

@@ -314,7 +314,7 @@ def mcp(msg, who, role, key):
     if method == "initialize":
         info = params.get("clientInfo") or {}
         if info.get("name"):
-            mcp_names[key] = "%s %s" % (info["name"], info.get("version", "")).strip()
+            mcp_names[key] = ("%s %s" % (info["name"], info.get("version", ""))).strip()
     if mid is None:
         return None
     if method == "initialize":
@@ -554,6 +554,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, out) if out else self.send(202, b"", "text/plain")
         except ERRORS as e:
             return self.send(400, {"error": str(e)})
+        except Exception:  # never drop an MCP client's connection: answer with a JSON-RPC error instead
+            log.exception("MCP request failed")
+            return self.send(500, {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": "internal error"}})
 
     def do_DELETE(self):
         self.route_api("DELETE")
