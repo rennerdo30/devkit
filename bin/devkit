@@ -104,6 +104,54 @@ def step_label(cmd):
     return (a[0] + " " + verb).strip()
 
 
+def process_snapshot():
+    """Process identities only: never collect command lines or environment values."""
+    result = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,pgid=,stat=,lstart="],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                            timeout=1, check=True, env=dict(os.environ, LC_ALL="C"))
+    processes = {}
+    for line in result.stdout.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) == 5:
+            pid, parent, group = map(int, fields[:3])
+            processes[pid] = (parent, group, fields[3], fields[4])
+    return processes
+
+
+class ProcessChildren:
+    """Track only descendants of our child, retaining identity across reparenting."""
+    def __init__(self, pid):
+        self.pid, self.tracked = pid, {}
+        self.birth, self.retired, self.group_owned = None, False, False
+        self.root_exited = False
+
+    def alive(self):
+        snapshot = process_snapshot()
+        root = snapshot.get(self.pid)
+        if self.birth is None and root is not None and not self.retired:
+            self.birth = root[3]
+        root_matches = root is not None and root[3] == self.birth and not self.retired
+        self.root_exited = root is None or root[2].startswith("Z")
+        if not root_matches:
+            self.retired = True
+        owned = {pid for pid, birth in self.tracked.items()
+                 if pid in snapshot and snapshot[pid][3] == birth}
+        self.group_owned = root_matches or any(snapshot[pid][1] == self.pid for pid in owned)
+        if root_matches:
+            owned.add(self.pid)
+        while True:
+            found = {pid for pid, (parent, group, _, _) in snapshot.items()
+                     if parent in owned or (self.group_owned and group == self.pid)}
+            added = found - owned
+            if not added:
+                break
+            owned.update(added)
+        for pid in owned - {self.pid}:
+            self.tracked[pid] = snapshot[pid][3]
+        return [pid for pid, birth in self.tracked.items()
+                if pid in snapshot and snapshot[pid][3] == birth and not snapshot[pid][2].startswith("Z")]
+
+
 # ---------------------------------------------------------------- job context handed to kinds
 class Ctx:
     Fail = Fail
@@ -169,12 +217,30 @@ class Ctx:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         pending = ""
         os.set_blocking(p.stdout.fileno(), False)
+        children = ProcessChildren(p.pid)
+        next_snapshot = 0
 
         def stop(sig):
             try:
-                os.killpg(p.pid, sig)
-            except ProcessLookupError:
-                pass
+                owned = children.alive()  # retain children before their parent exits
+            except (OSError, ValueError, subprocess.SubprocessError):
+                owned = []  # a failed snapshot must never prevent parent/group shutdown
+            try:
+                if p.poll() is None or children.group_owned:
+                    os.killpg(p.pid, sig)
+            except (PermissionError, ProcessLookupError):
+                # macOS can report EPERM for a group whose leader has exited.
+                # Popen polls before signalling, so an already-reaped child is safe.
+                try:
+                    p.kill() if sig == signal.SIGKILL else p.terminate()
+                except (PermissionError, ProcessLookupError):
+                    if p.poll() is None:
+                        self.log("DEVKIT could not signal child pid=%s" % p.pid)
+            for pid in owned:
+                try:
+                    os.kill(pid, sig)
+                except (PermissionError, ProcessLookupError):
+                    pass  # recheck after escalation; never claim a live survivor is stopped
 
         def emit(data, final=False):
             nonlocal pending
@@ -195,6 +261,9 @@ class Ctx:
         try:
             while True:
                 current = time.monotonic()
+                if current >= next_snapshot:
+                    children.alive()
+                    next_snapshot = current + 0.1
                 cancelled = cancelled or os.path.exists(self.cancel_file)
                 timed_out = timed_out or current >= deadline
                 if stopping is None and (cancelled or timed_out):
@@ -202,6 +271,8 @@ class Ctx:
                     stopping = current
                 if stopping is not None and current - stopping >= PROCESS_STOP_GRACE:
                     stop(signal.SIGKILL)
+                if stopping is not None and current - stopping >= PROCESS_STOP_GRACE * 2 + 0.5:
+                    break  # even an unsignallable parent must reach the bounded reap
                 eof = False
                 try:
                     chunk = os.read(p.stdout.fileno(), 65536)
@@ -212,7 +283,9 @@ class Ctx:
                     chunk = b""
                 # A reaped parent can leave stdout open in a child. Stop its own
                 # process group and drain only for a bounded grace period.
-                if p.poll() is not None:
+                # Snapshot descendants before reaping an exited leader; otherwise
+                # fast children can be reparented before their ownership is recorded.
+                if children.root_exited and p.poll() is not None:
                     if eof:
                         stop(signal.SIGKILL)
                         break
@@ -223,16 +296,23 @@ class Ctx:
                         break
                 if not chunk:
                     time.sleep(0.02)
-            p.wait(timeout=PROCESS_STOP_GRACE + 1)
         finally:
-            if p.poll() is None:
+            try:
+                # Always clean up tracked descendants, even after normal parent exit.
                 stop(signal.SIGKILL)
                 p.wait(timeout=PROCESS_STOP_GRACE + 1)
-            p.stdout.close()
-            emit(b"", final=True)
-            self.st["pid"] = None
-            step.update(finished=time.time(), exit=p.returncode)
-            save(self.st)
+                reap_deadline = time.monotonic() + PROCESS_STOP_GRACE
+                while children.alive():
+                    if time.monotonic() >= reap_deadline:
+                        raise Fail("tracked child processes survived termination")
+                    stop(signal.SIGKILL)
+                    time.sleep(0.02)
+            finally:
+                p.stdout.close()
+                emit(b"", final=True)
+                self.st["pid"] = None
+                step.update(finished=time.time(), exit=p.returncode)
+                save(self.st)
         if cancelled or os.path.exists(self.cancel_file):
             raise Cancelled()
         if timed_out:
@@ -532,7 +612,7 @@ def v_cancel(a):
     if st.get("pid"):
         try:
             os.killpg(st["pid"], signal.SIGTERM)  # the current step's own process group only (start_new_session)
-        except ProcessLookupError:
+        except (PermissionError, ProcessLookupError):
             pass
     return {"id": a.id, "state": "cancelling"}
 
