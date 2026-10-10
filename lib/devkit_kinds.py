@@ -9,13 +9,95 @@ Common params (job "params" object):
                         unity job's Xcode export: {"from_job": "<id>", "project": "iOS/Unity-iPhone.xcodeproj"}
 Targets (job "target"): ios (device), ios-sim, macos.
 """
-import glob, os, plistlib, re
+import glob, json, math, os, plistlib, re
+import xml.etree.ElementTree as ET
 
 TARGETS = ("ios", "ios-sim", "macos")
 UNITY_EDITORS = "/Applications/Unity/Hub/Editor"
 DEFAULT_TEMPLATE = "Time Profiler"
 DEFAULT_PROFILE_SECONDS = 30
 DEFAULT_LAUNCH_SECONDS = 60
+UNITY_MAX_TIMEOUT = 4 * 3600
+UNITY_PARAMS = {
+    "mode": {"type": "string", "enum": ["executeMethod", "test"], "default": "executeMethod"},
+    "method": {"type": "string", "pattern": r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$", "description": "Static Editor method for executeMethod builds or compile gates."},
+    "build_target": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*$", "description": "Optional Unity -buildTarget; omitted for the project's active target."},
+    "unity_version": {"type": "string", "pattern": r"^[0-9]+\.[0-9]+\.[0-9]+[abfp][0-9]+$", "description": "Defaults to the checkout's ProjectSettings/ProjectVersion.txt."},
+    "quit": {"type": "boolean", "description": "executeMethod only; default true. False for gates that exit themselves."},
+    "nographics": {"type": "boolean", "default": False, "description": "Optional -nographics. Leave false for graphics-dependent PlayMode tests."},
+    "test_platform": {"type": "string", "enum": ["EditMode", "PlayMode"]},
+    "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": UNITY_MAX_TIMEOUT, "default": UNITY_MAX_TIMEOUT,
+                "description": "Hard limit in seconds, including waiting for the host's Unity slot."},
+    "extra": {"type": "array", "items": {"type": "string"}, "description": "Allow-list: -accept-apiupdate, -force-metal, -force-glcore; tests also -testFilter VALUE, -testCategory VALUE, -assemblyNames VALUE, and EditMode-only -runSynchronously. Managed flags and credentials rejected."},
+}
+UNITY_EXTRA_SWITCHES = {"-accept-apiupdate", "-force-metal", "-force-glcore"}
+UNITY_TEST_SWITCHES = {"-runSynchronously"}
+UNITY_TEST_VALUES = {"-testFilter", "-testCategory", "-assemblyNames"}
+
+
+def unity_timeout(params):
+    value = params.get("timeout", UNITY_MAX_TIMEOUT)
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= UNITY_MAX_TIMEOUT:
+        raise ValueError("Unity timeout must be greater than 0 and at most 14400 seconds")
+    return value
+
+
+def validate_unity_params(params, test_only=False):
+    """Validate before admission and again in the worker; return normalized mode and extra argv."""
+    if not isinstance(params, dict):
+        raise ValueError("Unity params must be an object")
+    unknown = set(params) - set(UNITY_PARAMS)
+    if unknown:
+        raise ValueError("unknown Unity params: " + ", ".join(sorted(unknown)))
+    mode = params.get("mode", "test" if test_only else "executeMethod")
+    if mode not in ("executeMethod", "test") or (test_only and mode != "test"):
+        raise ValueError("Unity mode must be executeMethod or test (unity-test requires test)")
+    for key in ("quit", "nographics"):
+        if key in params and type(params[key]) is not bool:
+            raise ValueError("Unity " + key + " must be boolean")
+    for key in ("method", "build_target", "unity_version", "test_platform"):
+        if key in params and (not isinstance(params[key], str) or not params[key]):
+            raise ValueError("Unity " + key + " must be a non-empty string")
+    if mode == "executeMethod":
+        if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", params.get("method", ""), re.ASCII):
+            raise ValueError("Unity executeMethod requires a qualified static method")
+        if "test_platform" in params:
+            raise ValueError("test_platform is only valid for Unity test mode")
+    else:
+        if params.get("test_platform") not in ("EditMode", "PlayMode"):
+            raise ValueError("Unity tests require test_platform EditMode or PlayMode")
+        if "method" in params or "quit" in params:
+            raise ValueError("Unity tests manage their own exit; method and quit are executeMethod-only")
+    if "build_target" in params and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", params["build_target"]):
+        raise ValueError("invalid Unity build_target")
+    if "unity_version" in params and not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+[abfp][0-9]+", params["unity_version"]):
+        raise ValueError("invalid Unity unity_version")
+    unity_timeout(params)
+    extra = params.get("extra", [])
+    if not isinstance(extra, list) or any(not isinstance(x, str) or not x or "\x00" in x for x in extra):
+        raise ValueError("Unity extra must be a list of non-empty strings")
+    switches = UNITY_EXTRA_SWITCHES | (UNITY_TEST_SWITCHES if mode == "test" else set())
+    values = UNITY_TEST_VALUES if mode == "test" else set()
+    seen, i = set(), 0
+    while i < len(extra):
+        flag = extra[i]
+        if flag in seen:
+            raise ValueError("duplicate Unity extra flag: " + flag)
+        seen.add(flag)
+        if flag in switches:
+            i += 1
+        elif flag in values:
+            if i + 1 >= len(extra) or extra[i + 1].startswith("-"):
+                raise ValueError("Unity extra flag requires a value: " + flag)
+            i += 2
+        else:
+            # Do not reflect rejected values: callers may accidentally submit credentials.
+            raise ValueError("Unity extra contains an argument outside the allow-list")
+    if "-force-metal" in seen and "-force-glcore" in seen:
+        raise ValueError("Unity extra must select only one graphics API")
+    if "-runSynchronously" in seen and params.get("test_platform") != "EditMode":
+        raise ValueError("runSynchronously is only supported for EditMode")
+    return mode, extra
 EXPORT_METHODS = ("development", "release-testing", "app-store-connect", "developer-id", "debugging", "enterprise")
 
 
@@ -337,19 +419,77 @@ def k_crashlogs(ctx):
 
 
 def k_unity(ctx):
-    """Unity batch build: params.build_target (iOS, OSXUniversal, Android, WebGL), params.method (static build method).
-    Editor version from params.unity_version or ProjectSettings/ProjectVersion.txt. Output goes to $DEVKIT_ARTIFACTS."""
-    need(ctx, "build_target", "method")
+    """Hidden Unity batch jobs. mode=executeMethod (default): method required; build_target optional;
+    quit=true by default, false for self-exiting compile gates. mode=test: test_platform=EditMode|PlayMode
+    required; no method/quit. Both support nographics=false, unity_version, timeout (0 < seconds <= 14400)
+    and allow-listed extra argv (-accept-apiupdate, -force-metal, -force-glcore; tests also -testFilter,
+    -testCategory, -assemblyNames and EditMode-only -runSynchronously). Editor version defaults to
+    ProjectSettings/ProjectVersion.txt. $DEVKIT_ARTIFACTS holds outputs, TestResults.xml, test-summary.json
+    and job.log. FIFO with one Unity slot per host owner account, shared across data directories."""
+    unity(ctx)
+
+
+def k_unity_test(ctx):
+    """Alias for unity with mode=test: test_platform=EditMode|PlayMode required. Hidden batchmode,
+    optional build_target/nographics/unity_version/allow-listed extra/timeout; results and job.log are artifacts.
+    The test runner exits itself; method and quit are rejected. Uses the same host Unity slot."""
+    unity(ctx, test_only=True)
+
+
+def unity(ctx, test_only=False):
+    try:
+        mode, extra = validate_unity_params(ctx.p, test_only)
+    except ValueError as e:
+        raise ctx.Fail(str(e)) from e
     version = ctx.p.get("unity_version")
     if not version:
         with open(inside(ctx, "ProjectSettings/ProjectVersion.txt")) as f:
-            version = re.search(r"m_EditorVersion:\s*(\S+)", f.read()).group(1)
+            match = re.search(r"m_EditorVersion:\s*(\S+)", f.read())
+        if not match:
+            raise ctx.Fail("ProjectVersion.txt has no m_EditorVersion")
+        version = match.group(1)
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+[abfp][0-9]+", version):
+        raise ctx.Fail("invalid Unity editor version")
     editor = os.path.join(UNITY_EDITORS, version, "Unity.app", "Contents", "MacOS", "Unity")
-    if not os.path.exists(editor):
-        raise ctx.Fail("Unity %s is not installed (have: %s)" % (version, ", ".join(sorted(os.listdir(UNITY_EDITORS)))))
-    ctx.run([editor, "-batchmode", "-quit", "-projectPath", ctx.work, "-buildTarget", ctx.p["build_target"],
-             "-executeMethod", ctx.p["method"], "-logFile", "-"] + [str(x) for x in ctx.p.get("extra") or []],
-            timeout=4 * 3600)
+    if not os.path.isfile(editor):
+        installed = sorted(os.listdir(UNITY_EDITORS)) if os.path.isdir(UNITY_EDITORS) else []
+        raise ctx.Fail("Unity %s is not installed (have: %s)" % (version, ", ".join(installed)))
+    cmd = [editor, "-batchmode", "-projectPath", ctx.work, "-logFile", "-"]
+    if ctx.p.get("nographics", False):
+        cmd.append("-nographics")
+    if ctx.p.get("build_target"):
+        cmd += ["-buildTarget", ctx.p["build_target"]]
+    if mode == "executeMethod":
+        if ctx.p.get("quit", True):
+            cmd.append("-quit")
+        ctx.run(cmd + ["-executeMethod", ctx.p["method"]] + extra, timeout=unity_timeout(ctx.p))
+        return
+    results = os.path.join(ctx.art, "TestResults.xml")
+    code = ctx.run(cmd + ["-runTests", "-testPlatform", ctx.p["test_platform"], "-testResults", results] + extra,
+                   check=False, timeout=unity_timeout(ctx.p))
+    summary = {"platform": ctx.p["test_platform"], "exit_code": code}
+    error = None
+    try:
+        root = ET.parse(results).getroot()
+        if root.tag != "test-run":
+            raise ValueError("expected NUnit test-run root")
+        summary.update(result=root.get("result"), total=int(root.get("total", "0")),
+                       passed=int(root.get("passed", "0")), failed=int(root.get("failed", "0")),
+                       skipped=int(root.get("skipped", "0")), inconclusive=int(root.get("inconclusive", "0")))
+        counts = [summary[key] for key in ("passed", "failed", "skipped", "inconclusive")]
+        if any(value < 0 for value in counts) or sum(counts) != summary["total"]:
+            raise ValueError("inconsistent NUnit result counts")
+        if summary["result"] != "Passed" or summary["failed"] or summary["total"] <= 0:
+            error = "Unity test results are not a passing, non-empty run"
+    except (OSError, ET.ParseError, ValueError) as e:
+        error = "Unity test results missing or invalid: " + str(e)
+    if error:
+        summary["error"] = error
+    ctx.write("test-summary.json", json.dumps(summary, indent=2))
+    if code:
+        raise ctx.Fail("Unity tests exited with code %s; inspect TestResults.xml and job.log" % code)
+    if error:
+        raise ctx.Fail(error)
 
 
-KINDS = {name[2:]: fn for name, fn in globals().items() if name.startswith("k_")}
+KINDS = {name[2:].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("k_")}

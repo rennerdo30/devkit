@@ -82,7 +82,119 @@ Other MCP clients can use the endpoint directly: `POST <host>:7420/mcp` with `Au
 | CLI | `bin/devkit <verb>` (`ping`, `queue`, `status`, `list`, `log`, `cancel`, `artifacts`, `devices`, `simulators`, `signing`, `kinds`) |
 
 Job kinds: `build`, `test`, `archive`, `release`, `notarize`, `deploy`, `launch`, `profile`, `screenshot`, `crashlogs`,
-`unity`, `shell`, `echo`. `GET /api/kinds` documents their parameters.
+`unity`, `unity-test`, `shell`, `echo`. `GET /api/kinds` documents their parameters.
+
+## Unity builds, compile gates and tests (0.6.0)
+
+`unity` defaults to `params.mode: "executeMethod"`. Existing build requests continue to work. `method` is a qualified
+static Editor method; `build_target` is optional. `quit` defaults to true; set it to false for asynchronous gates that
+call `EditorApplication.Exit` themselves. Return a nonzero exit code or throw on compile/gate failure. Project methods
+write their output under the `DEVKIT_ARTIFACTS` environment variable.
+
+Example `devkit_queue` arguments (also the JSON body for `POST /api/jobs`):
+
+```json
+{"project":"game","repo":"https://github.com/OWNER/GAME.git","commit":"EXACT_SHA","kind":"unity",
+ "params":{"method":"CompileGate.Run","quit":false,"nographics":true,"timeout":1800}}
+```
+
+For Unity Test Framework, use `kind: "unity", params.mode: "test"`, or the equivalent `unity-test` kind:
+
+```json
+{"project":"game","repo":"https://github.com/OWNER/GAME.git","commit":"EXACT_SHA","kind":"unity-test",
+ "params":{"test_platform":"EditMode","nographics":true,"timeout":1800,
+           "extra":["-testFilter","Game.Tests","-assemblyNames","Game.Editor.Tests"]}}
+```
+
+Use `test_platform: "PlayMode"` for tests running in the Editor. Test jobs invoke `-runTests -testPlatform ...
+-testResults <artifacts>/TestResults.xml`; they exit through the test runner and reject `quit` and `method`.
+Leave `nographics` false (the default) for graphics-dependent tests. Unity always receives `-batchmode`, preventing
+interactive Editor windows; callers cannot override it. Editor version comes from `ProjectSettings/ProjectVersion.txt`
+unless `unity_version` is supplied. The pinned editor must already be installed in Unity Hub's standard Mac location.
+The project must contain the Unity Test Framework package and test assemblies.
+
+`extra` is an argv list, with these accepted flags only:
+
+- All Unity modes: `-accept-apiupdate`, `-force-metal`, `-force-glcore` (one graphics API).
+- Tests: `-testFilter VALUE`, `-testCategory VALUE`, `-assemblyNames VALUE`.
+- EditMode only: `-runSynchronously`, which excludes multi-frame tests; omit it for full coverage.
+
+Unknown params, managed flags (project path, log path, results path, quit, batchmode), credential flags and malformed
+argv are rejected before queueing. Arbitrary project-specific flags require a reviewed extension of the host allow-list.
+See the official [Editor command-line reference](https://docs.unity3d.com/6000.0/Documentation/Manual/EditorCommandLineArguments.html)
+and [Test Framework command-line reference](https://docs.unity3d.com/Packages/com.unity.test-framework@1.4/manual/reference-command-line.html).
+
+The existing worker drains FIFO, one job at a time. Unity also holds `~/.local/state/devkit/unity.lock` across all
+`DEVKIT_DATA` directories on the host, before checkout and until its process group is stopped and logs are captured.
+Run all devkit instances under the supported single host owner account. Other user accounts and manually launched
+Editors do not participate in this lock. A child inherits the lock, so worker termination cannot admit another Unity
+while that child remains alive. Do not delete the lock file while a runner may be using it.
+
+`timeout` is a positive number of seconds, capped at 14400 (four hours, the default). The deadline includes slot wait,
+checkout and execution. Timeout and cancellation terminate only the job's own process group, escalating to kill after
+one second; log draining is bounded. `job.log` is an artifact for every completed Unity job, including failures and
+cancellations. Tests add `TestResults.xml` and `test-summary.json` when produced. Missing/malformed XML, an empty test
+run, failed results or a nonzero Editor exit fail the job. Partial results remain fetchable after failure/timeout.
+
+Use `devkit_artifacts` or `GET /api/jobs/<id>/artifacts` for sizes and SHA-256. Use `devkit_read_artifact` for XML,
+summary and logs, or download `GET /api/jobs/<id>/artifacts/<path>` (streaming and byte ranges supported).
+`devkit_log` and the existing log API retain live output. Pass the returned host to MCP queries for a forwarded job.
+
+### Tests
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+Tests use disposable editor executables and temporary job stores; no credentials, Unity license, Mac, or network
+are required. POSIX tests exercise real process groups, TERM-resistant processes, deadlines under continuous output,
+host slot exclusion and the MCP queue → status → artifacts → read flow. Windows runs the argument/result tests and
+skips POSIX host tests. Native Unity EditMode/PlayMode acceptance must be run on the Mac after the owner updates it.
+
+### Update the Mac host (owner-operated)
+
+This change is source-only; no running Mac checkout or service has been changed. Before updating, stop submissions
+and let all queued/running jobs become terminal in the web UI. Existing detached workers must finish before restarting.
+Keep the same OS account, data directory, existing credentials and service start method. Do not print configuration
+or credential files. In the Mac's `~/Development/devkit` checkout:
+
+```sh
+cd ~/Development/devkit
+git status --short                    # stop and preserve any source changes
+git fetch origin feature/unity-gates-tests
+git log -1 --oneline origin/feature/unity-gates-tests
+git branch backup/before-unity-gates HEAD
+git switch -c update/unity-gates-tests --track origin/feature/unity-gates-tests
+python3 -m unittest discover -s tests -v
+```
+
+Choose the restart procedure matching the current installation:
+
+- Source LaunchAgent: `bin/install-launchagent` reinstalls/restarts `dev.devkit.server` from this checkout.
+  If a custom LaunchAgent supplies `DEVKIT_DATA` or other settings, preserve that plist and instead run
+  `launchctl kickstart -k gui/$(id -u)/dev.devkit.server`.
+- Manual source server: stop the existing server in its terminal and start `bin/devkit-server` with the same
+  `DEVKIT_DATA`, port and environment as before.
+- Menu bar app: Quit Devkit from its menu; the app bundles its own Python sources, so a source checkout update alone
+  is insufficient. Preserve the installed app, run `app/build.sh`, then install and start the rebuilt app:
+
+  ```sh
+  backup_dir="$HOME/Devkit-backups/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$backup_dir"
+  ditto /Applications/Devkit.app "$backup_dir/Devkit.app"
+  app/build.sh
+  ditto dist/Devkit.app /Applications/Devkit.app
+  open /Applications/Devkit.app
+  ```
+
+  Use the existing signing identity; an ad-hoc rebuild can reset screen recording permission. App data stays at
+  `~/Library/Application Support/Devkit`; do not replace or erase it. Run only one installation at a time.
+
+Reconnect/reload MCP so callers receive the new tool schema; `initialize` must report version `0.6.0` and
+`devkit_kinds` must include `unity-test`. Verify a self-exiting compile gate without `build_target`, then one EditMode
+and one PlayMode job on exact commits. Fetch XML and `job.log`; compare artifact checksums. Finally verify a short
+timeout and two queued Unity requests. Retain native acceptance evidence separately from the fixture test results.
+Rollback source code to `backup/before-unity-gates` and restart the same installation if needed; retain all runtime data.
 
 ## Access
 

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """devkit: single-queue Xcode/Unity job runner. Every verb prints one JSON object."""
-import argparse, fcntl, hashlib, json, os, platform, re, shutil, signal, subprocess, sys, time, uuid
+import argparse, codecs, fcntl, hashlib, json, os, platform, re, shutil, signal, subprocess, sys, time, uuid
 
 CODE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 ROOT = os.path.realpath(os.environ.get("DEVKIT_DATA") or CODE)  # data dir; a second instance can use its own
@@ -15,6 +15,8 @@ NO_CHECKOUT_KINDS = ("echo", "screenshot", "crashlogs", "launch")
 UNITY_EDITORS = devkit_kinds.UNITY_EDITORS
 PROFILES_DIR = os.path.expanduser("~/Library/Developer/Xcode/UserData/Provisioning Profiles")
 DEFAULT_STEP_TIMEOUT = 3 * 3600
+PROCESS_STOP_GRACE = 1.0
+UNITY_SLOT = os.path.expanduser("~/.local/state/devkit/unity.lock")
 DISPLAY_KINDS = ("launch", "profile", "screenshot", "deploy", "test")  # simulator / Instruments need the display awake
 BUNDLE_SUFFIXES = (".app", ".trace", ".xcresult", ".xcarchive", ".dSYM")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -115,6 +117,8 @@ class Ctx:
         self.inputs = None  # set when params.from_job stages an earlier job's artifacts
         self.cfg = config()
         self.cancel_file = os.path.join(JOBS, st["id"], "cancel")
+        self.unity_deadline = None
+        self.unity_slot_fd = None
 
     def log(self, msg):
         self.logf.write(redact(msg.rstrip("\n")) + "\n")
@@ -149,37 +153,87 @@ class Ctx:
                 "expected_seconds": timeout if timeout_ok else None}
         self.st.setdefault("steps", []).append(step)
         full_env = dict(os.environ, DEVKIT_JOB=self.st["id"], DEVKIT_ARTIFACTS=self.art, DEVKIT_MUTE="1", **(env or {}))
+        limit = timeout if timeout is not None else DEFAULT_STEP_TIMEOUT
+        deadline = time.monotonic() + limit
+        if self.unity_deadline is not None:
+            deadline = min(deadline, self.unity_deadline)
+        if time.monotonic() >= deadline:
+            raise Fail("Unity job timed out before step")
         p = subprocess.Popen(cmd, cwd=cwd or (self.work if os.path.isdir(self.work) else self.art), env=full_env,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             errors="replace", start_new_session=True)
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             start_new_session=True,
+                             pass_fds=(self.unity_slot_fd,) if self.unity_slot_fd is not None else ())
         self.st["pid"] = p.pid
         save(self.st)
-        limit = timeout or DEFAULT_STEP_TIMEOUT
-        deadline = time.time() + limit
-        timed_out = False
+        timed_out, cancelled, stopping = False, False, None
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        pending = ""
         os.set_blocking(p.stdout.fileno(), False)
-        while True:
-            line = p.stdout.readline()
-            if line:
+
+        def stop(sig):
+            try:
+                os.killpg(p.pid, sig)
+            except ProcessLookupError:
+                pass
+
+        def emit(data, final=False):
+            nonlocal pending
+            pending += decoder.decode(data, final=final)
+            # Bound memory for a tool that never emits a newline.
+            while "\n" in pending or len(pending) >= 65536:
+                end = pending.find("\n") + 1 if "\n" in pending else 65536
+                line, pending = pending[:end], pending[end:]
                 self.logf.write(redact(line))
-                out is not None and out.append(line)
-                continue
-            if p.poll() is not None:
-                break
-            if time.time() > deadline:
-                timed_out = True
-                os.killpg(p.pid, signal.SIGTERM)
-                p.wait(timeout=30)
-                break
-            time.sleep(0.2)
-        os.set_blocking(p.stdout.fileno(), True)
-        for line in p.stdout:
-            self.logf.write(redact(line))
-            out is not None and out.append(line)
-        self.st["pid"] = None
-        step.update(finished=time.time(), exit=p.returncode)
-        save(self.st)
-        if os.path.exists(self.cancel_file):
+                if out is not None:
+                    out.append(line)
+            if final and pending:
+                self.logf.write(redact(pending))
+                if out is not None:
+                    out.append(pending)
+                pending = ""
+
+        try:
+            while True:
+                current = time.monotonic()
+                cancelled = cancelled or os.path.exists(self.cancel_file)
+                timed_out = timed_out or current >= deadline
+                if stopping is None and (cancelled or timed_out):
+                    stop(signal.SIGTERM)
+                    stopping = current
+                if stopping is not None and current - stopping >= PROCESS_STOP_GRACE:
+                    stop(signal.SIGKILL)
+                eof = False
+                try:
+                    chunk = os.read(p.stdout.fileno(), 65536)
+                    eof = not chunk
+                    if chunk:
+                        emit(chunk)
+                except BlockingIOError:
+                    chunk = b""
+                # A reaped parent can leave stdout open in a child. Stop its own
+                # process group and drain only for a bounded grace period.
+                if p.poll() is not None:
+                    if eof:
+                        stop(signal.SIGKILL)
+                        break
+                    if stopping is None:
+                        stop(signal.SIGTERM)
+                        stopping = current
+                    if current - stopping >= PROCESS_STOP_GRACE + 0.5:
+                        break
+                if not chunk:
+                    time.sleep(0.02)
+            p.wait(timeout=PROCESS_STOP_GRACE + 1)
+        finally:
+            if p.poll() is None:
+                stop(signal.SIGKILL)
+                p.wait(timeout=PROCESS_STOP_GRACE + 1)
+            p.stdout.close()
+            emit(b"", final=True)
+            self.st["pid"] = None
+            step.update(finished=time.time(), exit=p.returncode)
+            save(self.st)
+        if cancelled or os.path.exists(self.cancel_file):
             raise Cancelled()
         if timed_out:
             self.log("DEVKIT step stopped after %ss" % limit)
@@ -213,12 +267,32 @@ def execute(st):
     save(st)
     awake = keep_awake(st["kind"])
     state, code = "failed", 1
+    unity_slot = None
+    is_unity = st["kind"] in ("unity", "unity-test")
     with open(os.path.join(d, "log.txt"), "w", buffering=1) as log:
         log.write("DEVKIT commit=%s project=%s kind=%s target=%s\n" % (st["commit"], st["project"], st["kind"], st["target"] or ""))
         ctx = Ctx(st, log, art)
         try:
+            if is_unity:
+                devkit_kinds.validate_unity_params(ctx.p, test_only=st["kind"] == "unity-test")
+                os.makedirs(os.path.dirname(UNITY_SLOT), exist_ok=True)
+                unity_slot = open(UNITY_SLOT, "a")
+                ctx.unity_deadline = time.monotonic() + devkit_kinds.unity_timeout(ctx.p)
+                ctx.log("DEVKIT waiting for host Unity slot")
+                while True:
+                    if os.path.exists(ctx.cancel_file):
+                        raise Cancelled()
+                    if time.monotonic() >= ctx.unity_deadline:
+                        raise Fail("Unity job timed out waiting for host slot")
+                    try:
+                        fcntl.flock(unity_slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.1)
+                ctx.unity_slot_fd = unity_slot.fileno()
+                ctx.log("DEVKIT acquired host Unity slot")
             if st["repo"] and st["kind"] not in NO_CHECKOUT_KINDS:
-                st["resolved"] = checkout(st, log)
+                st["resolved"] = checkout(st, log, ctx if is_unity else None)
                 save(st)
             os.makedirs(ctx.derived, exist_ok=True)
             if ctx.p.get("from_job"):
@@ -231,11 +305,26 @@ def execute(st):
         except Exception as e:  # any job failure goes to its log; the worker keeps draining
             log.write("DEVKIT error: %s\n" % redact(str(e)))
         log.write("DEVKIT state=%s\n" % state)
+    if is_unity:
+        try:
+            shutil.copyfile(os.path.join(d, "log.txt"), os.path.join(art, "job.log"))
+        except OSError as e:
+            state, code = "failed", 1
+            st["error"] = "could not publish job.log: " + redact(str(e))
+            try:
+                with open(os.path.join(d, "log.txt"), "a") as log:
+                    log.write("DEVKIT error: %s\n" % st["error"])
+                    log.write("DEVKIT state=failed\n")
+            except OSError:
+                pass  # terminal state still records the artifact publication failure
+        finally:
+            if unity_slot is not None:
+                unity_slot.close()
     if awake:
         awake.terminate()
     shutil.rmtree(os.path.join(INPUTS, st["id"]), ignore_errors=True)
     if state == "failed":
-        st["error"] = failure_reason(os.path.join(d, "log.txt"))
+        st["error"] = st.get("error") or failure_reason(os.path.join(d, "log.txt"))
     st.update(state=state, exit_code=code, finished=now(), pid=None)
     save(st)
 
@@ -312,17 +401,22 @@ def failure_reason(log_path):
     return None
 
 
-def checkout(st, log):
+def checkout(st, log, ctx=None):
     w = os.path.join(WORK, st["project"])
 
     def git(*a, check=True):
+        if ctx is not None:
+            return ctx.run(["git", "-C", w] + list(a), cwd=ctx.art, check=check, timeout=3600)
         return subprocess.run(["git", "-C", w] + list(a), stdin=subprocess.DEVNULL, stdout=log,
                               stderr=subprocess.STDOUT, check=check, timeout=3600).returncode
 
     if not os.path.isdir(os.path.join(w, ".git")):
         os.makedirs(w, exist_ok=True)
         git("init", "-q")
-    subprocess.run(["git", "-C", w, "remote", "remove", "origin"], capture_output=True)
+    if ctx is not None:
+        git("remote", "remove", "origin", check=False)
+    else:
+        subprocess.run(["git", "-C", w, "remote", "remove", "origin"], capture_output=True)
     git("remote", "add", "origin", st["repo"])
     if git("fetch", "-q", "--depth", "1", "origin", st["commit"], check=False) == 0:
         rev = "FETCH_HEAD"  # branch, tag or full SHA
@@ -331,7 +425,12 @@ def checkout(st, log):
         rev = st["commit"]
     git("-c", "advice.detachedHead=false", "checkout", "-q", "--force", rev)
     git("clean", "-q", "-fdx", "-e", "Library/")  # keep Unity's import cache between builds
-    sha = run(["git", "-C", w, "rev-parse", "HEAD"])
+    if ctx is not None:
+        output = []
+        ctx.run(["git", "-C", w, "rev-parse", "HEAD"], cwd=ctx.art, out=output)
+        sha = "".join(output).strip()
+    else:
+        sha = run(["git", "-C", w, "rev-parse", "HEAD"])
     log.write("DEVKIT checked out %s\n" % sha)
     return sha
 
@@ -379,6 +478,11 @@ def v_queue(a):
     params = json.loads(a.params) if isinstance(a.params, str) else (a.params or {})
     if not isinstance(params, dict):
         raise Fail("params must be a JSON object")
+    if a.kind in ("unity", "unity-test"):
+        try:
+            devkit_kinds.validate_unity_params(params, test_only=a.kind == "unity-test")
+        except ValueError as e:
+            raise Fail(str(e)) from e
     jobs = all_jobs()
     jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     os.makedirs(os.path.join(JOBS, jid))
@@ -409,7 +513,10 @@ def v_list(a):
 
 def v_log(a):
     p = os.path.join(jdir(a.id), "log.txt")
-    lines = open(p, errors="replace").readlines() if os.path.exists(p) else []
+    lines = []
+    if os.path.exists(p):
+        with open(p, errors="replace") as f:
+            lines = f.readlines()
     return {"id": a.id, "text": "".join(lines[-a.tail:] if a.tail else lines)}
 
 

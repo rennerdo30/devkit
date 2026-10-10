@@ -35,7 +35,16 @@ Common jobs:
 | Profile | `profile` | `bundle_id` (device/simulator) or `app` (macOS), `template` (default Time Profiler), `duration` |
 | Tests | `test` | `scheme`; result bundle in artifacts |
 | TestFlight / notarized Mac build | `release` | `scheme`, `team_id` |
-| Unity batch build | `unity` | `build_target`, `method` |
+| Unity build or compile gate | `unity` | `method`; optional `build_target`, `quit` (default true; false for self-exiting gates), `nographics`, `timeout` |
+| Unity Editor tests | `unity-test` or `unity` with `mode: "test"` | `test_platform: "EditMode"` or `"PlayMode"`; optional `nographics`, `timeout`, allow-listed `extra` |
+
+Unity jobs always run hidden batchmode, share one slot per host owner account, and have a hard timeout (maximum/default
+four hours, including slot wait and checkout). `test` remains Xcode-only. Unity Test Framework jobs exit themselves;
+do not pass `quit` or `method` to test mode. Leave `nographics` false for graphics-dependent PlayMode tests. Results
+and logs use the existing artifact tools: `TestResults.xml`, `test-summary.json`, `job.log`; failed and cancelled jobs
+retain available artifacts. `extra` permits `-accept-apiupdate`, one of `-force-metal`/`-force-glcore`; tests also permit
+`-testFilter VALUE`, `-testCategory VALUE`, `-assemblyNames VALUE`, and EditMode-only `-runSynchronously` (excludes
+multi-frame tests). Managed flags and unknown params are rejected. Reconnect MCP after updating the host to 0.6.0.
 
 To build what an earlier job produced (for example the Xcode project a `unity` job exported), pass that job's id as
 `params.from_job` and give `project`/`workspace` relative to its artifacts, e.g.

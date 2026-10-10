@@ -15,7 +15,7 @@ DEFAULT_LIMIT = 20
 MAX_BODY = 1 << 20
 STREAM_CHUNK = 1 << 20
 MCP_PROTOCOL = "2025-06-18"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 CLIENT_ACTIVE_SECONDS = 60
 ACTIVITY_SIZE = 300
 ACTIVITY_LOG = os.path.join(ROOT, "logs", "activity.jsonl")
@@ -262,11 +262,13 @@ MCP_TOOLS = [
     ("device_apps", "Apps installed on a physical device (bundle ids for launch/profile).", ID_ONLY),
     ("signing", "Code signing identities, provisioning profile count, App Store Connect / notary credentials configured.", O),
     ("queue", "Queue a job (FIFO per host): build, test, archive, release (TestFlight / notarized macOS), deploy to an iPhone or "
-              "simulator, launch with arguments, profile with Instruments, screenshot, crashlogs, unity, or shell. commit may be a "
+              "simulator, launch with arguments, profile with Instruments, screenshot, crashlogs, unity (executeMethod builds/compile gates "
+              "or mode=test), unity-test (EditMode/PlayMode), or shell. Unity always runs hidden batchmode with one host slot and a hard timeout. commit may be a "
               "SHA, branch or tag. The result names the host that runs it; pass that host to status/log/artifacts.",
      {"type": "object", "properties": {"project": S, "repo": S, "commit": S, "kind": {"type": "string", "enum": list(dk.KINDS)},
                                        "target": {"type": "string", "enum": list(dk.devkit_kinds.TARGETS)}, "device": S,
-                                       "args": S, "params": {"type": "object"}},
+                                       "args": S, "params": {"type": "object", "properties": dk.devkit_kinds.UNITY_PARAMS,
+                                                             "description": "Unity params shown here; other kinds accept their documented params from devkit_kinds. Unity test results and job.log are artifacts."}},
       "required": ["project", "commit", "kind"]}),
     ("list", "List recent jobs, newest first.", {"type": "object", "properties": {"limit": I}}),
     ("status", "Job state (queued, running, succeeded, failed, cancelled) with per-step timing and, when failed, the plain-language error.", ID_ONLY),
@@ -277,6 +279,26 @@ MCP_TOOLS = [
     ("read_artifact", "Read a text artifact of a job (json, txt, log, xml, crash reports), up to 512 KB, e.g. profile-summary.json.",
      {"type": "object", "properties": {"id": S, "path": S}, "required": ["id", "path"]}),
 ]
+for _tool, _desc, _schema in MCP_TOOLS:
+    if _tool == "queue":
+        # Conditional schemas keep existing Xcode params open while documenting
+        # Unity's admission rules in tools/list for every MCP caller.
+        _schema["allOf"] = [
+            {"if": {"properties": {"kind": {"const": "unity"}}, "required": ["kind"]},
+             "then": {"required": ["params"], "properties": {"params": {
+                 "type": "object", "properties": dk.devkit_kinds.UNITY_PARAMS, "additionalProperties": False,
+                 "oneOf": [
+                     {"properties": {"mode": {"const": "executeMethod"}}, "required": ["method"],
+                      "not": {"required": ["test_platform"]}},
+                     {"properties": {"mode": {"const": "test"}}, "required": ["mode", "test_platform"],
+                      "not": {"anyOf": [{"required": ["method"]}, {"required": ["quit"]}]}}
+                 ]}}}},
+            {"if": {"properties": {"kind": {"const": "unity-test"}}, "required": ["kind"]},
+             "then": {"required": ["params"], "properties": {"params": {
+                 "type": "object", "properties": dict(dk.devkit_kinds.UNITY_PARAMS, mode={"const": "test"}),
+                 "required": ["test_platform"], "additionalProperties": False,
+                 "not": {"anyOf": [{"required": ["method"]}, {"required": ["quit"]}]}}}}}
+        ]
 for _tool, _desc, _schema in MCP_TOOLS:
     if _tool != "hosts":
         _schema.setdefault("properties", {})["host"] = HOST
