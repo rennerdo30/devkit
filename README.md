@@ -143,7 +143,22 @@ summary and logs, or download `GET /api/jobs/<id>/artifacts/<path>` (streaming a
 ### Tests
 
 ```sh
-python3 -m unittest discover -s tests -v
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-test.txt
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Schema tests validate every advertised tool against JSON Schema draft 2020-12 and require all 16 tools, including
+`devkit_queue`, for every role. Tool input schemas use a plain object at the root: Claude's API rejects top-level
+`allOf`, `oneOf` and `anyOf` even though they are valid JSON Schema. Unity's conditional rules are enforced by the
+server before a job is saved or a worker starts; the queue schema documents them without root combinators.
+
+The runner-only checks can also run without the schema-test dependency:
+
+```sh
+python3 -m unittest discover -s tests -p test_unity.py -v
+python3 -m unittest discover -s tests -p test_runner.py -v
+python3 -m unittest discover -s tests -p test_mcp.py -v
 ```
 
 Tests use disposable editor executables and temporary job stores; no credentials, Unity license, Mac, or network
@@ -165,7 +180,9 @@ git fetch origin feature/unity-gates-tests
 git log -1 --oneline origin/feature/unity-gates-tests
 git branch backup/before-unity-gates HEAD
 git switch -c update/unity-gates-tests --track origin/feature/unity-gates-tests
-python3 -m unittest discover -s tests -v
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-test.txt
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 Choose the restart procedure matching the current installation:

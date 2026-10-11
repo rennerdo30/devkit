@@ -63,7 +63,7 @@ class McpUnityTests(unittest.TestCase):
         self.assertEqual(props["quit"]["type"], "boolean")
         self.assertEqual(props["extra"]["type"], "array")
         self.assertEqual(props["test_platform"]["enum"], ["EditMode", "PlayMode"])
-        self.assertEqual(len(queue["allOf"]), 2)
+        self.assertFalse({"allOf", "oneOf", "anyOf"} & queue.keys())
 
     def test_invalid_jobs_rejected_before_worker(self):
         for params in ({}, {"method": "Gate.Run", "quit": "false"},
@@ -73,6 +73,18 @@ class McpUnityTests(unittest.TestCase):
             with self.subTest(params=params), patch.object(self.dk.subprocess, "Popen") as process:
                 result = self.call("queue", {"project": "fixture", "commit": "none", "kind": "unity", "params": params})
                 self.assertTrue(result["isError"])
+                process.assert_not_called()
+        self.assertEqual(os.listdir(self.dk.JOBS), [])
+
+    def test_unity_test_rules_still_enforced_without_schema_conditionals(self):
+        for params in ({}, {"test_platform": "EditMode", "quit": False},
+                       {"test_platform": "EditMode", "method": "Gate.Run"},
+                       {"test_platform": "EditMode", "mode": "executeMethod"},
+                       {"test_platform": "EditMode", "unknown": True}):
+            with self.subTest(params=params), patch.object(self.dk.subprocess, "Popen") as process:
+                result = self.call("queue", {"project": "fixture", "commit": "none", "kind": "unity-test", "params": params})
+                self.assertTrue(result["isError"])
+                self.assertTrue(result["structuredContent"]["error"])
                 process.assert_not_called()
         self.assertEqual(os.listdir(self.dk.JOBS), [])
 

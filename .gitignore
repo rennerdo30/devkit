@@ -16,6 +16,7 @@ apps-*.json
 *.tmp
 
 # tooling
+.venv/
 __pycache__/
 *.pyc
 .DS_Store

@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """devkit-server: web UI, HTTP JSON API and MCP (streamable HTTP, JSON responses) over the devkit job queue.
 Several servers (macOS now; Windows and Linux later) can be connected as peers and reached through any one of them."""
-import argparse, collections, importlib.machinery, json, logging, mimetypes, os, re, secrets, sys, threading, time, types, urllib.parse
+import argparse, collections, copy, importlib.machinery, json, logging, mimetypes, os, re, secrets, sys, threading, time, types, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BIN = os.path.dirname(os.path.realpath(__file__))
@@ -268,7 +268,8 @@ MCP_TOOLS = [
      {"type": "object", "properties": {"project": S, "repo": S, "commit": S, "kind": {"type": "string", "enum": list(dk.KINDS)},
                                        "target": {"type": "string", "enum": list(dk.devkit_kinds.TARGETS)}, "device": S,
                                        "args": S, "params": {"type": "object", "properties": dk.devkit_kinds.UNITY_PARAMS,
-                                                             "description": "Unity params shown here; other kinds accept their documented params from devkit_kinds. Unity test results and job.log are artifacts."}},
+                                                             "additionalProperties": True,
+                                                             "description": "Unity: executeMethod (default) requires method and forbids test_platform; test requires test_platform and forbids method/quit. unity-test defaults to test. Unknown Unity params are rejected by the server before queueing. Other kinds accept their documented params from devkit_kinds."}},
       "required": ["project", "commit", "kind"]}),
     ("list", "List recent jobs, newest first.", {"type": "object", "properties": {"limit": I}}),
     ("status", "Job state (queued, running, succeeded, failed, cancelled) with per-step timing and, when failed, the plain-language error.", ID_ONLY),
@@ -279,29 +280,27 @@ MCP_TOOLS = [
     ("read_artifact", "Read a text artifact of a job (json, txt, log, xml, crash reports), up to 512 KB, e.g. profile-summary.json.",
      {"type": "object", "properties": {"id": S, "path": S}, "required": ["id", "path"]}),
 ]
-for _tool, _desc, _schema in MCP_TOOLS:
-    if _tool == "queue":
-        # Conditional schemas keep existing Xcode params open while documenting
-        # Unity's admission rules in tools/list for every MCP caller.
-        _schema["allOf"] = [
-            {"if": {"properties": {"kind": {"const": "unity"}}, "required": ["kind"]},
-             "then": {"required": ["params"], "properties": {"params": {
-                 "type": "object", "properties": dk.devkit_kinds.UNITY_PARAMS, "additionalProperties": False,
-                 "oneOf": [
-                     {"properties": {"mode": {"const": "executeMethod"}}, "required": ["method"],
-                      "not": {"required": ["test_platform"]}},
-                     {"properties": {"mode": {"const": "test"}}, "required": ["mode", "test_platform"],
-                      "not": {"anyOf": [{"required": ["method"]}, {"required": ["quit"]}]}}
-                 ]}}}},
-            {"if": {"properties": {"kind": {"const": "unity-test"}}, "required": ["kind"]},
-             "then": {"required": ["params"], "properties": {"params": {
-                 "type": "object", "properties": dict(dk.devkit_kinds.UNITY_PARAMS, mode={"const": "test"}),
-                 "required": ["test_platform"], "additionalProperties": False,
-                 "not": {"anyOf": [{"required": ["method"]}, {"required": ["quit"]}]}}}}}
-        ]
-for _tool, _desc, _schema in MCP_TOOLS:
-    if _tool != "hosts":
-        _schema.setdefault("properties", {})["host"] = HOST
+def prepare_mcp_tools(tools):
+    """Own each schema and keep discovery compatible with Claude tool inputs.
+
+    Root combinators are valid JSON Schema but unsupported by Claude's API.
+    Unity's conditional admission rules remain in validate_unity_params, which
+    v_queue calls before saving a job or starting a worker.
+    """
+    prepared = []
+    for name, description, template in tools:
+        schema = copy.deepcopy(template)
+        if schema.get("type") != "object" or any(k in schema for k in ("allOf", "oneOf", "anyOf")):
+            raise ValueError("devkit_%s needs an object input schema without root combinators" % name)
+        if name != "hosts":
+            schema.setdefault("properties", {})["host"] = copy.deepcopy(HOST)
+        prepared.append((name, description, schema))
+    if not any(name == "queue" for name, _, _ in prepared):
+        raise ValueError("devkit_queue must be advertised")
+    return prepared
+
+
+MCP_TOOLS = prepare_mcp_tools(MCP_TOOLS)
 
 
 def forward_tool(name, args, who):
