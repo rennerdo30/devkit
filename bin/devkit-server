@@ -15,7 +15,6 @@ DEFAULT_LIMIT = 20
 MAX_BODY = 1 << 20
 STREAM_CHUNK = 1 << 20
 MCP_PROTOCOL = "2025-06-18"
-VERSION = "0.6.0"
 CLIENT_ACTIVE_SECONDS = 60
 ACTIVITY_SIZE = 300
 ACTIVITY_LOG = os.path.join(ROOT, "logs", "activity.jsonl")
@@ -31,6 +30,7 @@ _loader = importlib.machinery.SourceFileLoader("devkit", os.path.join(BIN, "devk
 dk = types.ModuleType(_loader.name)
 dk.__file__ = _loader.path
 _loader.exec_module(dk)
+VERSION = dk.devkit_build.VERSION
 import devkit_auth as auth, devkit_hosts as hosts, devkit_system as system  # noqa: E402  (lib/ is on sys.path via devkit)
 
 ERRORS = (dk.Fail, OSError, ValueError, KeyError, dk.subprocess.SubprocessError, hosts.PeerError)
@@ -128,6 +128,19 @@ def watch_jobs():
     known = {}
     while True:
         try:
+            if any(st["state"] in ("queued", "running") for st in dk.all_jobs()):
+                # Detached workers and their child processes retain the worker flock.
+                with open(dk.LOCK, "a") as lock:
+                    try:
+                        dk.fcntl.flock(lock, dk.fcntl.LOCK_EX | dk.fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        idle = False
+                    else:
+                        idle = True
+                if idle:
+                    dk.subprocess.Popen([sys.executable, os.path.join(BIN, "devkit"), "_worker"],
+                                        stdin=dk.subprocess.DEVNULL, stdout=dk.subprocess.DEVNULL,
+                                        stderr=dk.subprocess.DEVNULL, start_new_session=True)
             for st in dk.all_jobs()[-100:]:
                 prev = known.get(st["id"])
                 if prev is not None and prev != st["state"] and st["state"] != "queued":
@@ -167,7 +180,7 @@ def op_queue(p, who):
         if not p.get(k):
             raise dk.Fail("missing " + k)
     r = dk.v_queue(ns(project=p["project"], repo=p.get("repo"), commit=p["commit"], kind=p["kind"], target=p.get("target"),
-                      device=p.get("device"), args=p.get("args"), params=p.get("params"), by=who))
+                      device=p.get("device"), args=p.get("args"), params=p.get("params"), requires=p.get("requires"), by=who))
     where = " at " + p["commit"] if p["commit"] != "none" else ""
     presence.event(who, "queued %s %s%s" % (p["kind"], p["project"], where), "queued", r["id"])
     return dict(r, host=self_name())
@@ -212,7 +225,7 @@ def op_read_artifact(p, who):
 
 def op_hosts(p, who):
     me = dk.v_ping(None)
-    return {"hosts": [dict({k: me.get(k) for k in ("name", "platform", "host", "macos", "chip", "xcode", "queue_len", "running", "kinds", "targets")},
+    return {"hosts": [dict({k: me.get(k) for k in ("name", "version", "build", "disk", "unity_editors", "capabilities", "platform", "host", "macos", "chip", "xcode", "queue_len", "running", "kinds", "targets")},
                            self=True, online=True, url=None)] + peers.status()}
 
 
@@ -267,6 +280,7 @@ MCP_TOOLS = [
               "SHA, branch or tag. The result names the host that runs it; pass that host to status/log/artifacts.",
      {"type": "object", "properties": {"project": S, "repo": S, "commit": S, "kind": {"type": "string", "enum": list(dk.KINDS)},
                                        "target": {"type": "string", "enum": list(dk.devkit_kinds.TARGETS)}, "device": S,
+                                       "requires": {"type": "object", "properties": {k: {"type": "string"} for k in ("xcode", "sdk", "simulator_runtime", "unity_version")}, "additionalProperties": False},
                                        "args": S, "params": {"type": "object", "properties": dk.devkit_kinds.UNITY_PARAMS,
                                                              "additionalProperties": True,
                                                              "description": "Unity: executeMethod (default) requires method and forbids test_platform; test requires test_platform and forbids method/quit. unity-test defaults to test. Unknown Unity params are rejected by the server before queueing. Other kinds accept their documented params from devkit_kinds."}},
@@ -306,7 +320,7 @@ MCP_TOOLS = prepare_mcp_tools(MCP_TOOLS)
 def forward_tool(name, args, who):
     host = args.pop("host", None)
     if name == "queue" and host == "auto":
-        host = peers.route(args.get("target"), dict(dk.v_ping(None)))
+        host = peers.route(args.get("target"), dict(dk.v_ping(None)), args)
     if not host or host == self_name():
         return OPS[name](args, who)
     if name == "read_artifact":  # file contents come back raw over HTTP; wrap them like the local tool does
@@ -341,7 +355,8 @@ def mcp(msg, who, role, key):
         return None
     if method == "initialize":
         result = {"protocolVersion": params.get("protocolVersion") or MCP_PROTOCOL,
-                  "capabilities": {"tools": {}}, "serverInfo": {"name": "devkit", "version": VERSION}}
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "devkit", "version": VERSION,
+                  "build": dk.devkit_build.identity()}}
     elif method == "ping":
         result = {}
     elif method == "tools/list":
@@ -373,7 +388,7 @@ def ua_label(ua):
 def needed_role(method, parts):
     """Minimum role for an /api request (parts without the leading 'api')."""
     head = parts[0] if parts else ""
-    if head == "tokens" or (head == "hosts" and method != "GET" and len(parts) <= 2):
+    if head in ("tokens", "cleanup") or (head == "hosts" and method != "GET" and len(parts) <= 2):
         return "admin"
     if head == "hosts" and len(parts) > 2:  # forwarded to a peer: same rule as the forwarded path
         return needed_role(method, parts[2:])
@@ -485,10 +500,15 @@ class Handler(BaseHTTPRequestHandler):
             if parts[0] == "devices" and n == 3 and parts[2] == "apps":
                 return self.send(200, OPS["device_apps"]({"id": parts[1]}, who))
         elif method == "POST":
+            if parts == ["cleanup"]:
+                if type(body.get("apply", False)) is not bool:
+                    raise dk.Fail("apply must be boolean")
+                return self.send(200, dk.v_cleanup(ns(keep_last=body.get("keep_last", 50),
+                    older_than_days=body.get("older_than_days", 30), apply=body.get("apply", False))))
             if parts == ["jobs"]:
                 host = body.pop("host", None)
                 if host == "auto":
-                    host = peers.route(body.get("target"), dict(dk.v_ping(None)))
+                    host = peers.route(body.get("target"), dict(dk.v_ping(None)), body)
                 if host and host != self_name():
                     out = peers.call_json(peers.get(host), "POST", "/api/jobs", body, client="%s via %s" % (who, self_name()))
                     peers.cache = (0, [])  # the next auto-routed job should see this host's longer queue

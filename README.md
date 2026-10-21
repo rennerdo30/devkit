@@ -41,6 +41,35 @@ Settings → Access tokens.
 Jobs keep the Mac awake with `caffeinate` while they run (and the display, for launch and profiling jobs); an idle
 devkit lets the Mac sleep as usual.
 
+### Build identity and maintenance
+
+`GET /api/ping` returns `version`, `build` (Git commit, dirty flag, source SHA-256), `disk`, and host `capabilities`.
+The Hosts page displays the build identity. `app/build.sh` embeds `build-info.json` so the installed app identifies
+its source even outside a Git checkout. Comparing only the version is insufficient: multiple builds may share it.
+
+New jobs are refused when free space in the data volume is below `min_free_bytes` in the existing host config
+(default 2 GiB). The worker rechecks before checkout/execution. This is a reserve, not an estimate of build size.
+
+On server startup and while work is pending, the watcher wakes an idle worker. With the exclusive worker lock held,
+the worker reconciles interrupted `running` jobs to `failed`, preserving artifacts and recording an interruption reason.
+It never automatically replays a job, upload, or release. If a recorded PID/process group is still present or cannot
+be checked, recovery stops and the queue stays blocked rather than signalling it. Job processes inherit the worker
+lock, including checkout commands. Existing workers from an older app should finish before upgrading.
+
+Artifact retention is manual and defaults to a preview:
+
+```sh
+bin/devkit cleanup --keep-last 50 --older-than-days 30
+bin/devkit cleanup --keep-last 50 --older-than-days 30 --apply
+```
+
+The same operation is available to admin tokens through `POST /api/cleanup` with optional `keep_last`,
+`older_than_days`, and boolean `apply` (default false). Cleanup requires an idle worker and drained queue; admission
+and deletion are serialized. It removes only canonical artifact directories for terminal jobs older than the age
+limit, retaining the newest N terminal jobs and every artifact source referenced by another recorded job's
+`params.from_job`. Job metadata records `artifacts_expired`; checkout/import caches, credentials, configuration,
+job logs, and project data are retained. There is no scheduled deletion.
+
 ## Claude Code plugin
 
 The `plugin/` directory is a Claude Code plugin: it connects the devkit MCP server and adds a skill that teaches Claude
@@ -113,6 +142,11 @@ interactive Editor windows; callers cannot override it. Editor version comes fro
 unless `unity_version` is supplied. The pinned editor must already be installed in Unity Hub's standard Mac location.
 The project must contain the Unity Test Framework package and test assemblies.
 
+In the web UI, open a project → Unity build → Unity action. Choose **Build or compile gate** and an Editor method,
+or **Run tests** and EditMode/PlayMode. Set **Method exits itself** for an asynchronous gate. Build target is optional;
+graphics stays enabled by default. Test filters and assembly names become separate allow-listed argv values.
+Xcode defaults on the saved project are not sent as Unity parameters.
+
 `extra` is an argv list, with these accepted flags only:
 
 - All Unity modes: `-accept-apiupdate`, `-force-metal`, `-force-glcore` (one graphics API).
@@ -146,6 +180,8 @@ summary and logs, or download `GET /api/jobs/<id>/artifacts/<path>` (streaming a
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-test.txt
 .venv/bin/python -m unittest discover -s tests -v
+node --test tests/test_ui.cjs
+node --check web/app.js
 ```
 
 Schema tests validate every advertised tool against JSON Schema draft 2020-12 and require all 16 tools, including
@@ -224,6 +260,21 @@ use it on a trusted network or put TLS in front of it; an operator token can run
 On host B, create an operator token named after host A. On host A, open Hosts → Connect a host and enter B's address
 and that token. Jobs can then target B explicitly or use `host: "auto"`, which picks an online host running the
 target's platform with the shortest queue. Requests are forwarded at most one hop.
+
+Automatic routing also requires the advertised job kind/target, disk readiness, any explicitly requested Unity
+editor version, and the device/simulator ID. For additional constraints, send e.g.
+`"requires":{"xcode":"26.0","sdk":"iphoneos26.0","simulator_runtime":"iOS-26-0"}` with `host:"auto"`.
+These strings must match advertised `capabilities`; `unity_version` is also accepted in `requires`. Hosts missing
+required facts are excluded. Supply `params.unity_version` or `requires.unity_version` when automatic placement
+must match an exact editor; the router does not fetch a project's pinned commit to discover its editor version.
+Requirements filter automatic placement; they do not switch Xcode installations or install SDKs/editors.
+
+CI runs Python regressions and JavaScript checks on GitHub-hosted Linux and macOS runners for this public repository,
+plus a Swift compilation on macOS. The workflow uses pinned action releases verified on 2026-10-22:
+[checkout 7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1) and
+[setup-python 7.0.0](https://github.com/actions/setup-python/releases/tag/v7.0.0), both published 2026-07-20.
+Tests use temporary stores and command fixtures; native device, signing, Unity acceptance and installed-app updates
+remain separate checks. Windows and Linux execution hosts remain outside the macOS v1 implementation.
 
 ## Layout
 

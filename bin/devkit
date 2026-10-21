@@ -1,11 +1,11 @@
 #!/usr/bin/python3
 """devkit: single-queue Xcode/Unity job runner. Every verb prints one JSON object."""
-import argparse, codecs, fcntl, hashlib, json, os, platform, re, shutil, signal, subprocess, sys, time, uuid
+import argparse, codecs, datetime, fcntl, hashlib, json, os, platform, re, shutil, signal, subprocess, sys, time, uuid
 
 CODE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 ROOT = os.path.realpath(os.environ.get("DEVKIT_DATA") or CODE)  # data dir; a second instance can use its own
 sys.path.insert(0, os.path.join(CODE, "lib"))
-import devkit_hosts, devkit_kinds  # noqa: E402
+import devkit_build, devkit_hosts, devkit_kinds  # noqa: E402
 
 JOBS, WORK, ARTIFACTS, DERIVED, INPUTS = (os.path.join(ROOT, d) for d in ("jobs", "work", "artifacts", "derived", "inputs"))
 CONFIG = os.path.join(ROOT, "config.json")
@@ -19,13 +19,15 @@ PROCESS_STOP_GRACE = 1.0
 UNITY_SLOT = os.path.expanduser("~/.local/state/devkit/unity.lock")
 DISPLAY_KINDS = ("launch", "profile", "screenshot", "deploy", "test")  # simulator / Instruments need the display awake
 BUNDLE_SUFFIXES = (".app", ".trace", ".xcresult", ".xcarchive", ".dSYM")
-SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
-REF_NAME = re.compile(r"^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$")  # commit SHA, branch or tag
+SAFE_NAME = re.compile(r"^(?!\.{1,2}\Z)[A-Za-z0-9._-]+\Z")
+REF_NAME = re.compile(r"^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+\Z")  # commit SHA, branch or tag
 PROJECTS = os.path.join(ROOT, "projects.json")
 PROJECT_FIELDS = ("name", "repo", "ref", "xcode", "scheme", "bundle_id", "team_id", "target", "device", "unity_build_target",
                   "unity_method", "notes")
 SECRET = re.compile(r"(?i)((?:token|password|passwd|secret|api[_-]?key)[=:]\s*)\S+|(://)[^/@\s]+@")
 SECRET_FLAGS = ("-authenticationKeyPath", "-authenticationKeyID", "-authenticationKeyIssuerID", "--keychain-profile", "--password")
+WORKER_LOCK_FD = None
+DEFAULT_MIN_FREE_BYTES = 2 * 1024 ** 3
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "/usr/bin:/bin")
 
 
@@ -210,8 +212,9 @@ class Ctx:
         p = subprocess.Popen(cmd, cwd=cwd or (self.work if os.path.isdir(self.work) else self.art), env=full_env,
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True,
-                             pass_fds=(self.unity_slot_fd,) if self.unity_slot_fd is not None else ())
+                             pass_fds=tuple(fd for fd in (self.unity_slot_fd, WORKER_LOCK_FD) if fd is not None))
         self.st["pid"] = p.pid
+        self.st["process_group"] = p.pid
         save(self.st)
         timed_out, cancelled, stopping = False, False, None
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -307,6 +310,7 @@ class Ctx:
                         raise Fail("tracked child processes survived termination")
                     stop(signal.SIGKILL)
                     time.sleep(0.02)
+                self.st["process_group"] = None
             finally:
                 p.stdout.close()
                 emit(b"", final=True)
@@ -327,16 +331,64 @@ class Ctx:
 
 # ---------------------------------------------------------------- worker
 def worker():
+    global WORKER_LOCK_FD
     lockf = open(LOCK, "w")
     try:
         fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return  # another worker is already draining the queue
-    while True:
-        queued = [s for s in all_jobs() if s["state"] == "queued"]
-        if not queued:
+    try:
+        WORKER_LOCK_FD = lockf.fileno()
+        if not recover_jobs():
             return
-        execute(queued[0])
+        while True:
+            queued = [s for s in all_jobs() if s["state"] == "queued"]
+            if not queued:
+                return
+            execute(queued[0])
+    finally:
+        WORKER_LOCK_FD = None
+        lockf.close()
+
+
+def recover_jobs():
+    """Called only with the worker lock. Never signal an orphan or replay a job."""
+    running = [s for s in all_jobs() if s["state"] == "running"]
+    for st in running:
+        for pid, group in ((st.get("pid"), False), (st.get("process_group"), True)):
+            if not isinstance(pid, int) or pid <= 1:
+                continue
+            try:
+                (os.killpg if group else os.kill)(pid, 0)
+                return False  # unknown/reused/live process: leave it alone and block admission
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                return False
+    for st in running:
+        st.update(state="failed", finished=now(), pid=None, exit_code=1,
+                  error="Worker interrupted; job was not replayed. Inspect retained artifacts before retrying.")
+        try:
+            log_path = os.path.join(jdir(st["id"]), "log.txt")
+            with open(log_path, "a") as log:
+                log.write("DEVKIT error: " + st["error"] + "\nDEVKIT state=failed\n")
+            if st["kind"] in ("unity", "unity-test"):
+                art = st.get("artifact_dir") or ""
+                expected = os.path.join(ARTIFACTS, st["project"], st["commit"].replace("/", "_"), st["id"])
+                if art == expected and os.path.realpath(art) == art and art.startswith(ARTIFACTS + os.sep):
+                    shutil.copyfile(log_path, os.path.join(art, "job.log"))
+        except OSError:
+            st["error"] += " Recovery could not publish the job log."
+        save(st)
+    return True
+
+
+def disk_status():
+    minimum = config().get("min_free_bytes", DEFAULT_MIN_FREE_BYTES)
+    if type(minimum) is not int or minimum < 0:
+        raise Fail("min_free_bytes must be a nonnegative integer")
+    free = shutil.disk_usage(ROOT).free
+    return {"free_bytes": free, "minimum_free_bytes": minimum, "ready": free >= minimum}
 
 
 def execute(st):
@@ -353,6 +405,8 @@ def execute(st):
         log.write("DEVKIT commit=%s project=%s kind=%s target=%s\n" % (st["commit"], st["project"], st["kind"], st["target"] or ""))
         ctx = Ctx(st, log, art)
         try:
+            if not disk_status()["ready"]:
+                raise Fail("Insufficient disk space; free space or adjust min_free_bytes before retrying")
             if is_unity:
                 devkit_kinds.validate_unity_params(ctx.p, test_only=st["kind"] == "unity-test")
                 os.makedirs(os.path.dirname(UNITY_SLOT), exist_ok=True)
@@ -372,7 +426,7 @@ def execute(st):
                 ctx.unity_slot_fd = unity_slot.fileno()
                 ctx.log("DEVKIT acquired host Unity slot")
             if st["repo"] and st["kind"] not in NO_CHECKOUT_KINDS:
-                st["resolved"] = checkout(st, log, ctx if is_unity else None)
+                st["resolved"] = checkout(st, log, ctx)
                 save(st)
             os.makedirs(ctx.derived, exist_ok=True)
             if ctx.p.get("from_job"):
@@ -523,8 +577,20 @@ _static = {}
 def static_info():
     """Facts that rarely change (chip, Xcode, Unity editors), refreshed at most once a minute."""
     if time.time() - _static.get("at", 0) > STATIC_TTL:
+        xcode = run(["xcodebuild", "-version"])
+        def optional(fn, key):
+            try:
+                return fn(None).get(key, [])
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+                return []
+        devices = optional(v_devices, "devices")
+        simulators = optional(v_simulators, "simulators")
         _static.update(at=time.time(), chip=run(["sysctl", "-n", "machdep.cpu.brand_string"]),
-                       xcode=run(["xcodebuild", "-version"]).replace("\n", " "),
+                       xcode=xcode.replace("\n", " "),
+                       capabilities={"xcode_version": (re.search(r"Xcode (\S+)", xcode).group(1) if re.search(r"Xcode (\S+)", xcode) else None),
+                           "sdks": re.findall(r"-sdk (\S+)", run(["xcodebuild", "-showsdks"])),
+                           "devices": [d["id"] for d in devices], "simulators": [d["id"] for d in simulators],
+                           "simulator_runtimes": sorted({s["runtime"] for s in simulators})},
                        unity=sorted(os.listdir(UNITY_EDITORS)) if os.path.isdir(UNITY_EDITORS) else [])
     return _static
 
@@ -533,10 +599,12 @@ def v_ping(a):
     info = static_info()
     jobs = all_jobs()
     cur = next((j for j in jobs if j["state"] == "running"), None)
-    return {"ok": True, "name": config().get("name") or platform.node().split(".")[0], "platform": devkit_hosts.PLATFORM,
+    return {"ok": True, "version": devkit_build.VERSION, "build": devkit_build.identity(), "disk": disk_status(),
+            "name": config().get("name") or platform.node().split(".")[0], "platform": devkit_hosts.PLATFORM,
             "host": platform.node(), "macos": platform.mac_ver()[0],
             "running": {k: cur.get(k) for k in ("id", "kind", "project", "target", "started", "requested_by")} if cur else None,
             "chip": info["chip"], "xcode": info["xcode"], "unity_editors": info["unity"],
+            "capabilities": info.get("capabilities", {}),
             "kinds": list(KINDS), "targets": list(devkit_kinds.TARGETS),
             "queue_len": sum(s["state"] in ("queued", "running") for s in jobs)}
 
@@ -547,6 +615,14 @@ def v_kinds(a):
 
 
 def v_queue(a):
+    with open(LOCK + ".queue", "a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        return queue_locked(a)
+
+
+def queue_locked(a):
+    if not disk_status()["ready"]:
+        raise Fail("Insufficient disk space; job was not queued")
     if not SAFE_NAME.match(a.project or ""):
         raise Fail("invalid --project")
     if not REF_NAME.match(a.commit or ""):
@@ -558,6 +634,11 @@ def v_queue(a):
     params = json.loads(a.params) if isinstance(a.params, str) else (a.params or {})
     if not isinstance(params, dict):
         raise Fail("params must be a JSON object")
+    requires = getattr(a, "requires", None) or {}
+    if isinstance(requires, str):
+        requires = json.loads(requires)
+    if not isinstance(requires, dict) or set(requires) - {"xcode", "sdk", "simulator_runtime", "unity_version"} or any(not isinstance(v, str) or not v for v in requires.values()):
+        raise Fail("requires must contain only nonempty xcode, sdk, simulator_runtime or unity_version strings")
     if a.kind in ("unity", "unity-test"):
         try:
             devkit_kinds.validate_unity_params(params, test_only=a.kind == "unity-test")
@@ -568,7 +649,7 @@ def v_queue(a):
     os.makedirs(os.path.join(JOBS, jid))
     save({"id": jid, "seq": (jobs[-1]["seq"] + 1) if jobs else 1, "project": a.project, "repo": a.repo or "",
           "commit": a.commit, "kind": a.kind, "target": a.target, "device": a.device, "args": a.args or "",
-          "params": params, "requested_by": getattr(a, "by", None) or "cli", "state": "queued", "created": now(), "pid": None, "started": None, "finished": None,
+          "params": params, "requires": requires, "requested_by": getattr(a, "by", None) or "cli", "state": "queued", "created": now(), "pid": None, "started": None, "finished": None,
           "exit_code": None, "artifact_dir": None})
     subprocess.Popen([sys.executable, os.path.realpath(__file__), "_worker"], stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
@@ -576,7 +657,7 @@ def v_queue(a):
 
 
 def public(st):
-    keys = ("id", "project", "repo", "commit", "resolved", "requested_by", "steps", "error", "kind", "target", "device", "args", "params", "state", "pid", "created",
+    keys = ("id", "project", "repo", "commit", "resolved", "requested_by", "steps", "error", "artifacts_expired", "kind", "target", "device", "args", "params", "requires", "state", "pid", "created",
             "started", "finished", "exit_code", "artifact_dir")
     out = {k: st.get(k) for k in keys}
     out["repo"] = redact(out["repo"] or "")
@@ -718,6 +799,56 @@ def v_artifacts(a):
     return {"id": a.id, "dir": d, "files": files}
 
 
+def v_cleanup(a):
+    """Retain metadata and caches; prune only old, terminal, unreferenced artifacts."""
+    keep, days = a.keep_last, a.older_than_days
+    if type(keep) is not int or keep < 1 or type(days) is not int or days < 1:
+        raise Fail("keep_last and older_than_days must be positive integers")
+    with open(LOCK + ".queue", "a") as admission, open(LOCK, "a") as lockf:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Fail("Worker is active; cleanup is unavailable")
+        jobs = all_jobs()
+        if any(j["state"] in ("queued", "running") for j in jobs):
+            raise Fail("Drain the queue before planning or applying cleanup")
+        terminal = [j for j in jobs if j["state"] in ("succeeded", "failed", "cancelled")]
+        protected = {j["id"] for j in terminal[-keep:]}
+        protected.update((j.get("params") or {}).get("from_job") for j in jobs)
+        cutoff = time.time() - days * 86400
+        candidates, removed = [], []
+        for st in terminal:
+            if st["id"] in protected or not st.get("finished") or not st.get("artifact_dir"):
+                continue
+            try:
+                stamp = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", st["finished"])
+                finished_date = datetime.datetime.fromisoformat(stamp)
+                if finished_date.tzinfo is None:
+                    continue
+                finished = finished_date.timestamp()
+            except ValueError:
+                continue
+            if finished >= cutoff:
+                continue
+            path = os.path.abspath(st["artifact_dir"])
+            expected = os.path.join(ARTIFACTS, st["project"], st["commit"].replace("/", "_"), st["id"])
+            if path != expected or os.path.realpath(path) != path or not path.startswith(ARTIFACTS + os.sep):
+                continue
+            if not os.path.isdir(path):
+                continue
+            size = sum(os.lstat(os.path.join(base, f)).st_size for base, dirs, files in os.walk(path)
+                       for f in files if not os.path.islink(os.path.join(base, f)))
+            candidates.append({"id": st["id"], "path": path, "bytes": size})
+            if a.apply:
+                shutil.rmtree(path)
+                st["artifacts_expired"] = now()
+                save(st)
+                removed.append(st["id"])
+        return {"dry_run": not a.apply, "candidates": candidates, "removed": removed,
+                "candidate_bytes": sum(c["bytes"] for c in candidates)}
+
+
 def main():
     os.makedirs(JOBS, exist_ok=True)
     if sys.argv[1:] == ["_worker"]:
@@ -729,7 +860,7 @@ def main():
     q = sub.add_parser("queue")
     for opt in ("project", "commit", "kind"):
         q.add_argument("--" + opt, required=True)
-    for opt in ("repo", "target", "device", "args", "params", "by"):
+    for opt in ("repo", "target", "device", "args", "params", "requires", "by"):
         q.add_argument("--" + opt)
     for v in ("status", "cancel", "artifacts"):
         sub.add_parser(v).add_argument("id")
@@ -737,6 +868,10 @@ def main():
     lg = sub.add_parser("log")
     lg.add_argument("id")
     lg.add_argument("--tail", type=int)
+    cleanup = sub.add_parser("cleanup")
+    cleanup.add_argument("--keep-last", type=int, default=50)
+    cleanup.add_argument("--older-than-days", type=int, default=30)
+    cleanup.add_argument("--apply", action="store_true")
     try:
         a = ap.parse_args()
     except SystemExit as e:
