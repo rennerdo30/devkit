@@ -185,8 +185,10 @@ escaping the checkout are rejected. Omitting it preserves the existing root-proj
 
 For build methods that write outside `DEVKIT_ARTIFACTS`, `params.collect` copies repo-relative files or directories
 after a successful Editor run (and passing results for test jobs). Each output keeps its last path component.
-Missing paths, traversal, escaping descendant symlinks, cycles and artifact-name collisions fail clearly. Copies use
-APFS clones where available, with a normal-copy fallback. Paths are relative to the repo, including when project_dir is set.
+Missing paths, traversal, absolute or escaping copied symlinks, cycles and artifact-name collisions fail clearly.
+Runner outputs (including job.log, job.json and test results) are reserved. Copies preserve symlinks and use APFS
+clones where available, with a normal-copy fallback; both obey cancellation and the Unity deadline. The copied tree
+is validated before acceptance. Paths are relative to the repo, including when project_dir is set.
 
 ```json
 {"project":"game","repo":"https://github.com/OWNER/GAME.git","commit":"EXACT_SHA","kind":"unity",
@@ -225,7 +227,8 @@ host file outside the job checkout. No checkout or Xcode is needed. A JDK is loc
 match the generic password already provisioned in Keychain under the given service/account.
 
 The job rewrites a copy, stripping `META-INF/*.SF`, `*.RSA`, `*.EC`, `*.DSA` while retaining `MANIFEST.MF`, signs with
-SHA256withRSA/SHA-256, then runs `jarsigner -verify -certs`. The password is captured in memory, supplied only through
+SHA256withRSA/SHA-256, then runs `jarsigner -verify -strict -certs`, requiring a verified result without warnings.
+The signed bundle's certificate must report at least RSA 2048 or EC 256. The password is captured in memory, supplied only through
 the signing child's environment and masked from its output; it is never added to argv, job params or artifacts.
 The resulting AAB and `aab-sign.json` contain its SHA-256, byte size and signer certificate SHA-256 from `keytool`.
 If a `bundletool` executable is on PATH, the report also includes available package/versionCode/versionName fields;

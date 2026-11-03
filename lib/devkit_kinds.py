@@ -13,7 +13,7 @@ aab-sign params: from_job, aab (relative artifact path), keystore_path (host fil
   alias, keychain_service, keychain_account. Passwords are read from Keychain only at execution time.
 Targets (job "target"): ios (device), ios-sim, macos; android for aab-sign.
 """
-import glob, hashlib, json, math, os, plistlib, re, shutil, subprocess, zipfile
+import glob, hashlib, json, math, os, plistlib, re, shutil, subprocess, time, zipfile
 import xml.etree.ElementTree as ET
 
 XCODE_TARGETS = ("ios", "ios-sim", "macos")
@@ -23,6 +23,10 @@ DEFAULT_TEMPLATE = "Time Profiler"
 DEFAULT_PROFILE_SECONDS = 30
 DEFAULT_LAUNCH_SECONDS = 60
 UNITY_MAX_TIMEOUT = 4 * 3600
+# Fixed runner/kind outputs must never be supplied by collect, even before they exist.
+RESERVED_ARTIFACT_NAMES = frozenset(name.casefold() for name in (
+    "job.log", "job.json", "TestResults.xml", "test-summary.json", "echo.txt",
+    "profile-summary.json", "aab-sign.json"))
 UNITY_PARAMS = {
     "project_dir": {"type": "string", "description": "Repo-relative Unity directory containing ProjectSettings/ProjectVersion.txt; defaults to repo root."},
     "collect": {"type": "array", "items": {"type": "string"}, "description": "Repo-relative outputs copied into artifacts by last path component after success."},
@@ -67,10 +71,14 @@ def contained_path(ctx, base, rel, allow_root=False):
 
 
 def validate_collect_tree(ctx, root, path, active=None):
-    """Validate descendants too: a safe directory may contain escaping symlinks."""
+    """Validate the copied tree, retaining only relative links inside this copy."""
     active = set() if active is None else active
+    if os.path.islink(path) and os.path.isabs(os.readlink(path)):
+        raise ctx.Fail("collect contains an absolute symlink escape")
     real = os.path.realpath(path)
-    if os.path.commonpath([os.path.realpath(root), real]) != os.path.realpath(root):
+    # Canonicalize the parent (e.g. system temp aliases), never a copied root link.
+    boundary = os.path.join(os.path.realpath(os.path.dirname(root)), os.path.basename(root))
+    if os.path.commonpath([boundary, real]) != boundary:
         raise ctx.Fail("collect contains a symlink escape")
     if os.path.isdir(real):
         if real in active:
@@ -81,21 +89,37 @@ def validate_collect_tree(ctx, root, path, active=None):
         raise ctx.Fail("collect requires existing regular files or directories")
 
 
+def remove_collect_copy(path):
+    if os.path.islink(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
 def collect_unity(ctx):
     for rel in ctx.p.get("collect", []):
-        source = contained_path(ctx, ctx.work, rel)
-        validate_collect_tree(ctx, ctx.work, source)
+        contained_path(ctx, ctx.work, rel)
+        source = os.path.join(ctx.work, os.path.normpath(rel))
         dest = os.path.join(ctx.art, os.path.basename(os.path.normpath(rel)))
-        if os.path.lexists(dest):
+        if os.path.basename(dest).casefold() in RESERVED_ARTIFACT_NAMES:
+            raise ctx.Fail("collect artifact name is reserved: " + os.path.basename(dest))
+        if any(name.casefold() == os.path.basename(dest).casefold() for name in os.listdir(ctx.art)):
             raise ctx.Fail("collect artifact name already exists: " + os.path.basename(dest))
-        # macOS clone-on-write where supported; fallback also works on other filesystems.
-        result = subprocess.run(["/bin/cp", "-cRL", source, dest], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if result.returncode:
-            if os.path.isdir(dest):
-                shutil.rmtree(dest)
-            elif os.path.lexists(dest):
-                os.unlink(dest)
-            shutil.copytree(source, dest) if os.path.isdir(source) else shutil.copy2(source, dest)
+        def remaining():
+            deadline = getattr(ctx, "unity_deadline", None)
+            return unity_timeout(ctx.p) if deadline is None else max(0, deadline - time.monotonic())
+        try:
+            # Preserve links on both paths; inspect the result after any source swaps.
+            # Both copies use the runner's cancellation and remaining job deadline.
+            if ctx.run(["/bin/cp", "-c", "-R", "-P", source, dest], check=False, timeout=remaining()):
+                remove_collect_copy(dest)
+                ctx.run(["/bin/cp", "-R", "-P", source, dest], timeout=remaining())
+            validate_collect_tree(ctx, dest, dest)
+        except BaseException:
+            remove_collect_copy(dest)
+            raise
 
 
 def unity_env(ctx):
@@ -127,6 +151,8 @@ def validate_unity_params(params, test_only=False):
         raise ValueError("Unity collect must be a list of relative paths")
     for path in collect:
         relative_path(path)
+        if os.path.basename(os.path.normpath(path)).casefold() in RESERVED_ARTIFACT_NAMES:
+            raise ValueError("collect artifact name is reserved")
     args = params.get("args", [])
     if not isinstance(args, list):
         raise ValueError("Unity args must be a list of strings")
@@ -691,15 +717,27 @@ def k_aab_sign(ctx):
         ctx.run([signer, "-keystore", keystore, "-sigalg", "SHA256withRSA", "-digestalg", "SHA-256",
                  "-storepass:env", "DEVKIT_AAB_PASSWORD", "-keypass:env", "DEVKIT_AAB_PASSWORD", aab, ctx.p["alias"]],
                 env={"DEVKIT_AAB_PASSWORD": password}, redact_values=[password])
-        ctx.run([signer, "-verify", "-certs", aab], redact_values=[password])
-        cert = []
+        verification = {"verified": False, "warning": False}
+        def inspect_verification(line):
+            verification["verified"] |= "jar verified." in line.lower()
+            verification["warning"] |= bool(re.search(r"\b(warning|unsigned|disabled|weak)\b", line, re.I))
+        ctx.run([signer, "-J-Duser.language=en", "-J-Duser.country=US", "-verify", "-strict", "-certs", aab],
+                parse_output=inspect_verification, redact_values=[password])
+        if not verification["verified"] or verification["warning"]:
+            raise ctx.Fail("AAB signature verification failed or reported warnings")
+        fingerprints, public_keys = [], []
+        def inspect_certificate(line):
+            fingerprints.extend(re.findall(r"SHA256:\s*((?:[0-9a-fA-F]{2}:){31}[0-9a-fA-F]{2})", line))
+            public_keys.extend(re.findall(r"Subject Public Key Algorithm:\s*(\d+)-bit\s+(RSA|EC)\s+key\b", line))
         ctx.run([keytool, "-J-Duser.language=en", "-J-Duser.country=US", "-printcert", "-jarfile", aab],
-                out=cert, redact_values=[password])
+                parse_output=inspect_certificate, redact_values=[password])
     finally:
         password = None
-    fingerprints = re.findall(r"SHA256:\s*((?:[0-9a-fA-F]{2}:){31}[0-9a-fA-F]{2})", "".join(cert))
     if not fingerprints:
         raise ctx.Fail("keytool did not report a signer certificate SHA-256")
+    if (not public_keys or len(public_keys) != len(fingerprints) or
+            any(int(bits) < {"RSA": 2048, "EC": 256}[algorithm] for bits, algorithm in public_keys)):
+        raise ctx.Fail("signer certificate requires at least RSA 2048 or EC 256 public key")
     digest = hashlib.sha256()
     with open(aab, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):

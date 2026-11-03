@@ -194,8 +194,11 @@ class Ctx:
         return args
 
     def run(self, cmd, cwd=None, env=None, check=True, timeout=None, timeout_ok=False, log_cmd=True, out=None,
-            capture_only=False, redact_values=()):
-        """Run one step in its own process group, streaming output to the job log; out (a list) also collects it."""
+            capture_only=False, redact_values=(), parse_output=None):
+        """Run a step; out/logs are masked. parse_output privately inspects raw lines/chunks.
+
+        Parsers must retain only derived fields, never raw output or secret-bearing errors.
+        """
         if os.path.exists(self.cancel_file):
             raise Cancelled()
         def mask(value):
@@ -257,17 +260,24 @@ class Ctx:
             pending += decoder.decode(data, final=final)
             # Bound memory for a tool that never emits a newline.
             while "\n" in pending or len(pending) >= 65536 + redaction_tail:
-                pending = mask(pending)
-                if "\n" not in pending and len(pending) < 65536 + redaction_tail:
-                    break
                 end = pending.find("\n") + 1 if "\n" in pending else 65536
-                # The lookahead tail retains secrets split across bounded chunks.
+                # Keep a secret crossing the chunk boundary wholly in the next chunk.
+                for secret in redact_values:
+                    if secret:
+                        start = pending.rfind(secret, max(0, end - len(secret) + 1), end + len(secret) - 1)
+                        if start != -1 and start < end < start + len(secret):
+                            end = start
                 line, pending = pending[:end], pending[end:]
+                if parse_output is not None:
+                    parse_output(line)
+                line = mask(line)
                 if not capture_only:
                     self.logf.write(redact(line))
                 if out is not None:
                     out.append(line)
             if final and pending:
+                if parse_output is not None:
+                    parse_output(pending)
                 pending = mask(pending)
                 if not capture_only:
                     self.logf.write(redact(pending))
