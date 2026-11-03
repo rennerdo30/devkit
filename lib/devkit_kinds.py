@@ -13,7 +13,7 @@ aab-sign params: from_job, aab (relative artifact path), keystore_path (host fil
   alias, keychain_service, keychain_account. Passwords are read from Keychain only at execution time.
 Targets (job "target"): ios (device), ios-sim, macos; android for aab-sign.
 """
-import glob, hashlib, json, math, os, plistlib, re, shutil, stat, subprocess, time, zipfile
+import glob, hashlib, json, math, os, plistlib, re, shutil, stat, subprocess, tempfile, time, zipfile
 import xml.etree.ElementTree as ET
 
 XCODE_TARGETS = ("ios", "ios-sim", "macos")
@@ -729,10 +729,100 @@ def strip_aab_signatures(source, dest):
                 shutil.copyfileobj(read, write, 1 << 20)
 
 
+def find_aapt2():
+    roots = [os.environ.get(name) for name in ("ANDROID_HOME", "ANDROID_SDK_ROOT")]
+    roots = [root for root in roots if root] or [os.path.expanduser("~/Library/Android/sdk")]
+    for root in roots:
+        candidates = glob.glob(os.path.join(root, "build-tools", "*", "aapt2"))
+        def version(path):
+            name = os.path.basename(os.path.dirname(path))
+            match = re.fullmatch(r"(\d+(?:\.\d+)*)(?:[-.]([A-Za-z]+)(\d+)?)?", name)
+            if not match:
+                return ((), False, "", 0)
+            return (tuple(int(n) for n in match[1].split(".")), match[2] is None,
+                    match[2] or "", int(match[3] or 0))
+        for path in sorted(candidates, key=version, reverse=True):
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return shutil.which("aapt2")
+
+
+def manifest_metadata(values, source):
+    metadata = {"package": None, "versionCode": None, "versionName": None, "manifest_source": source}
+    invalid = []
+    for key in ("package", "versionCode", "versionName", "minSdk", "targetSdk"):
+        value = values.get(key)
+        if key in ("versionCode", "minSdk", "targetSdk"):
+            if isinstance(value, str) and re.fullmatch(r"[0-9]+", value) and int(value) > 0:
+                metadata[key] = int(value)
+            elif key in values or key == "versionCode":
+                invalid.append(key)
+        elif isinstance(value, str) and (value or key == "versionName"):
+            metadata[key] = value
+        else:
+            invalid.append(key)
+    if invalid:
+        metadata["manifest_note"] = "Manifest fields unavailable or invalid: " + ", ".join(invalid) + "."
+    return metadata
+
+
+def aapt2_manifest(ctx, aab, tool):
+    values, elements = {}, []
+    fields = {"package": ("package", None), "versionCode": ("versionCode", "0101021b"),
+              "versionName": ("versionName", "0101021c"), "minSdkVersion": ("minSdk", "0101020c"),
+              "targetSdkVersion": ("targetSdk", "01010270")}
+    try:
+        with tempfile.TemporaryDirectory(prefix="devkit-manifest-") as directory:
+            archive = os.path.join(directory, "manifest.zip")
+            with zipfile.ZipFile(aab) as bundle, zipfile.ZipFile(archive, "w") as out:
+                with bundle.open("base/manifest/AndroidManifest.xml") as read, out.open("AndroidManifest.xml", "w") as write:
+                    shutil.copyfileobj(read, write, 1 << 20)
+            output = []
+            code = ctx.run([tool, "dump", "xmltree", archive, "--file", "AndroidManifest.xml"], out=output, check=False)
+        if code:
+            raise ValueError()
+        for line in "".join(output).splitlines():
+            indent = len(line) - len(line.lstrip())
+            element = re.match(r"\s*E: ([\w-]+)(?:\s|$)", line)
+            if element:
+                while elements and elements[-1][0] >= indent:
+                    elements.pop()
+                elements.append((indent, element[1]))
+                continue
+            attr = re.fullmatch(r'\s*A: (?:[\w]+:)?(\w+)(?:\(0x([0-9a-fA-F]+)\))?=(.*)', line)
+            if not attr or attr[1] not in fields:
+                continue
+            key, resource = fields[attr[1]]
+            scope = [name for _, name in elements]
+            expected = ["manifest", "uses-sdk"] if key in ("minSdk", "targetSdk") else ["manifest"]
+            if scope != expected or (resource is not None and (attr[2] or "").lower() != resource):
+                continue
+            raw = re.sub(r'\s+\(Raw: ".*"\)$', '', attr[3]).strip()
+            try:
+                if raw.startswith('"'):
+                    value = json.loads(raw)
+                else:
+                    value = raw if key in ("versionCode", "minSdk", "targetSdk") else None
+            except ValueError:
+                value = None
+            # Duplicate identity attributes are ambiguous, even if their values agree.
+            values[key] = None if key in values else value
+        return manifest_metadata(values, "aapt2")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        metadata = manifest_metadata({}, "aapt2")
+        metadata["manifest_note"] = "Package/version metadata skipped: aapt2 manifest unavailable or invalid."
+        return metadata
+
+
 def aab_manifest(ctx, aab):
     tool = shutil.which("bundletool")
     if not tool:
-        return {"manifest_note": "Package/version metadata skipped: bundletool is not installed."}
+        aapt2 = find_aapt2()
+        if aapt2:
+            return aapt2_manifest(ctx, aab, aapt2)
+        metadata = manifest_metadata({}, None)
+        metadata["manifest_note"] = "Package/version metadata skipped: bundletool is not installed and aapt2 is unavailable."
+        return metadata
     output = []
     code = ctx.run([tool, "dump", "manifest", "--bundle=" + aab, "--module=base"], out=output, check=False)
     try:
@@ -742,13 +832,17 @@ def aab_manifest(ctx, aab):
         if root.tag != "manifest":
             raise ValueError()
         android = "{http://schemas.android.com/apk/res/android}"
-        metadata = {k: v for k, v in {"package": root.get("package"), "versionCode": root.get(android + "versionCode"),
-                                     "versionName": root.get(android + "versionName")}.items() if v is not None}
-        if len(metadata) != 3:
-            metadata["manifest_note"] = "Some package/version metadata fields were unavailable in the bundletool manifest."
-        return metadata
+        sdk = root.find("uses-sdk")
+        values = {"package": root.get("package"), "versionCode": root.get(android + "versionCode"),
+                  "versionName": root.get(android + "versionName")}
+        for key in ("minSdk", "targetSdk"):
+            if sdk is not None and android + key + "Version" in sdk.attrib:
+                values[key] = sdk.get(android + key + "Version")
+        return manifest_metadata(values, "bundletool")
     except (ValueError, ET.ParseError):
-        return {"manifest_note": "Package/version metadata skipped: bundletool manifest unavailable or invalid."}
+        metadata = manifest_metadata({}, "bundletool")
+        metadata["manifest_note"] = "Package/version metadata skipped: bundletool manifest unavailable or invalid."
+        return metadata
 
 
 def verify_aab_signature(ctx, signer, aab, password):
@@ -801,7 +895,7 @@ def k_aab_sign(ctx):
     keystore_path (host regular file outside checkout), alias, keychain_service, keychain_account.
     Password is read from Keychain into child environment only. Rewrites old ZIP signature entries,
     signs SHA256withRSA/SHA-256, verifies and writes aab-sign.json (hash, size, signer certificate SHA-256,
-    optional bundletool package/version metadata or a clear skip note). Requires a JDK."""
+    optional bundletool/aapt2 manifest metadata or a clear skip note). Requires a JDK."""
     need_target(ctx, ("android",))
     try:
         validate_aab_sign_params(ctx.p)
@@ -849,7 +943,7 @@ def k_aab_sign(ctx):
     with open(aab, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             digest.update(chunk)
-    summary = {"sha256": digest.hexdigest(), "size": os.path.getsize(aab),
+    summary = {"path": os.path.basename(aab), "sha256": digest.hexdigest(), "size": os.path.getsize(aab),
                "signer_cert_sha256": fingerprints[0].replace(":", "").lower()}
     summary.update(aab_manifest(ctx, aab))
     ctx.write("aab-sign.json", json.dumps(summary, indent=2))
