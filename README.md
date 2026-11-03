@@ -230,9 +230,16 @@ The job rewrites a copy, stripping `META-INF/*.SF`, `*.RSA`, `*.EC`, `*.DSA` whi
 SHA256withRSA/SHA-256, then runs `jarsigner -verify -strict -certs`, requiring a verified result without warnings.
 The signed bundle's certificate must report at least RSA 2048 or EC 256. The password is captured in memory, supplied only through
 the signing child's environment and masked from its output; it is never added to argv, job params or artifacts.
-The resulting AAB and `aab-sign.json` contain its SHA-256, byte size and signer certificate SHA-256 from `keytool`.
-If a `bundletool` executable is on PATH, the report also includes available package/versionCode/versionName fields;
-otherwise it records a clear metadata skip note. This kind signs locally and does not upload to a store.
+The resulting `aab-sign.json` records the signed AAB's artifact-relative `path`, lowercase SHA-256, byte `size`
+and lowercase `signer_cert_sha256` from `keytool` (without colons). After signature verification, manifest metadata
+comes from `bundletool` on PATH when present, otherwise from Android SDK `aapt2`. SDK discovery checks
+`ANDROID_HOME`/`ANDROID_SDK_ROOT`, or the standard macOS Android SDK location, selecting the highest executable
+build-tools version, then falls back to PATH. The aapt2 fallback wraps the bundle's protobuf base manifest in a
+temporary ZIP for `dump xmltree`; it does not dump the AAB directly. The report always includes `package`,
+`versionCode` (a positive JSON integer), `versionName` and `manifest_source` (`"bundletool"`, `"aapt2"` or null).
+Unavailable or invalid identity fields stay null with a `manifest_note`; parsed `minSdk`/`targetSdk` integers are
+also included when available. If neither tool is available, identity fields and `manifest_source` remain null
+with a skip note. This kind signs locally and does not upload to a store.
 
 ### Tests
 
