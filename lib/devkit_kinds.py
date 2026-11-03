@@ -27,6 +27,7 @@ DEFAULT_TEMPLATE = "Time Profiler"
 DEFAULT_PROFILE_SECONDS = 30
 DEFAULT_LAUNCH_SECONDS = 60
 UNITY_MAX_TIMEOUT = 4 * 3600
+DEFAULT_STEP_TIMEOUT = 3 * 3600
 # Fixed runner/kind outputs must never be supplied by collect, even before they exist.
 RESERVED_ARTIFACT_NAMES = frozenset(name.casefold() for name in (
     "job.log", "job.json", "TestResults.xml", "test-summary.json", "echo.txt",
@@ -1046,20 +1047,24 @@ def mas_profile(ctx, path, team, bundle, fingerprint):
             with open(decoded, "rb") as f:
                 profile = plistlib.load(f)
             ent = profile["Entitlements"]
-            identifier = ent["com.apple.application-identifier"]
+            mas_authorize_entitlements(ctx, {"com.apple.developer.team-identifier": team}, ent)
+            identifier = ent.get("com.apple.application-identifier")
             prefixes = profile["ApplicationIdentifierPrefix"]
-            if (not isinstance(identifier, str) or not isinstance(prefixes, list) or not prefixes or
+            if (not isinstance(prefixes, list) or not prefixes or
                     any(not isinstance(p, str) or not re.fullmatch(r"[A-Z0-9]{10}", p) for p in prefixes)):
                 raise ValueError()
+            if not isinstance(identifier, str):
+                raise ctx.Fail("MAS profile does not authorize entitlement: com.apple.application-identifier")
             # A wildcard is allowed only as the final component and matches sub-identifiers.
             matches = any(identifier == prefix + "." + bundle or
                           (identifier.endswith(".*") and identifier.count("*") == 1 and
                            (prefix + "." + bundle).startswith(identifier[:-1])) for prefix in prefixes)
+            if not matches:
+                raise ctx.Fail("MAS profile does not authorize entitlement: com.apple.application-identifier")
             expiry = profile["ExpirationDate"]
             if expiry.tzinfo is None:
                 expiry = expiry.replace(tzinfo=datetime.timezone.utc)
             if (profile["Platform"] != ["OSX"] or profile["TeamIdentifier"] != [team] or
-                    ent["com.apple.developer.team-identifier"] != team or not matches or
                     ent.get("get-task-allow", False) is not False or ent.get("com.apple.security.get-task-allow", False) is not False or
                     "ProvisionedDevices" in profile or profile.get("ProvisionsAllDevices", False) is not False or
                     expiry <= datetime.datetime.now(datetime.timezone.utc) or
@@ -1072,6 +1077,62 @@ def mas_profile(ctx, path, team, bundle, fingerprint):
             return profile, prefix + "." + bundle
         except (OSError, ValueError, TypeError, KeyError, AttributeError, StopIteration, plistlib.InvalidFileException):
             raise ctx.Fail("invalid MAS profile: requires unexpired macOS App Store distribution, matching team, bundle and signing certificate") from None
+
+
+def mas_authorize_entitlements(ctx, values, permitted):
+    """Every effective entitlement must be granted by this exact profile."""
+    for key, requested in values.items():
+        allowed = permitted.get(key) if isinstance(permitted, dict) else None
+        authorized = False
+        if isinstance(permitted, dict) and key in permitted:
+            if type(requested) is bool:
+                authorized = type(allowed) is bool and (not requested or allowed)
+            elif isinstance(requested, list):
+                authorized = isinstance(allowed, list) and all(
+                    any(type(item) is type(grant) and item == grant for grant in allowed) for item in requested)
+            elif type(requested) is str and type(allowed) is str and key == "com.apple.application-identifier":
+                authorized = (requested == allowed or
+                              (allowed.endswith(".*") and allowed.count("*") == 1 and requested.startswith(allowed[:-1])))
+            else:
+                authorized = type(requested) is type(allowed) and requested == allowed
+        if not authorized:
+            raise ctx.Fail("MAS profile does not authorize entitlement: " + key)
+
+
+def mas_copy_app(ctx, source, app):
+    """Pin the artifact root and every ancestor; never open an absolute source parent."""
+    deadline = time.monotonic() + DEFAULT_STEP_TIMEOUT
+    if getattr(ctx, "unity_deadline", None) is not None:
+        deadline = min(deadline, ctx.unity_deadline)
+
+    def check():
+        if os.path.exists(getattr(ctx, "cancel_file", "")):
+            raise ctx.Cancelled()
+        if time.monotonic() >= deadline:
+            raise ctx.Fail("MAS job timed out during app copy or validation")
+
+    parent_fd = None
+    try:
+        check()
+        parent_fd = os.open(ctx.inputs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        contained_path(ctx, ctx.inputs, source)
+        parts = os.path.normpath(source).split(os.sep)
+        for name in parts[:-1]:
+            check()
+            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        copy_collect_entry(ctx, parent_fd, parts[-1], app, ".", check)
+        validate_collect_tree(ctx, app, app, check=check)
+        check()
+    except BaseException as e:
+        remove_collect_copy(app)
+        if isinstance(e, OSError):
+            raise ctx.Fail("MAS app source changed or could not be copied") from None
+        raise
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def mas_code_paths(app):
@@ -1123,13 +1184,7 @@ def k_mas_pkg(ctx):
     app = os.path.join(ctx.art, os.path.basename(source))
     if os.path.lexists(app) or os.path.lexists(os.path.join(ctx.art, "out.pkg")):
         raise ctx.Fail("MAS output already exists")
-    # Copy with pinned descriptors, then validate links only in the private copy.
-    parent_fd = os.open(os.path.dirname(source), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        copy_collect_entry(ctx, parent_fd, os.path.basename(source), app, ".", lambda: None)
-        validate_collect_tree(ctx, app, app)
-    finally:
-        os.close(parent_fd)
+    mas_copy_app(ctx, ctx.p["app"], app)
     try:
         info = app_info(app)
         bundle, version, build = (info[k] for k in ("CFBundleIdentifier", "CFBundleShortVersionString", "CFBundleVersion"))
@@ -1153,21 +1208,26 @@ def k_mas_pkg(ctx):
         raise ctx.Fail(str(e)) from None
     app_hash, app_authority, _ = mas_identity(ctx, team)
     _, installer_authority, installer_name = mas_identity(ctx, team, installer=True)
-    profile, app_identifier = mas_profile(ctx, profile_path, team, bundle, app_hash)
-    managed = {"com.apple.application-identifier": app_identifier, "com.apple.developer.team-identifier": team}
-    if any(k in values and values[k] != v for k, v in managed.items()):
-        raise ctx.Fail("MAS identity entitlements must match the provisioning profile")
-    if values.get("com.apple.developer.game-center") and profile["Entitlements"].get("com.apple.developer.game-center") is not True:
-        raise ctx.Fail("MAS profile must authorize Game Center")
-    values.update(managed)
-    values["com.apple.security.app-sandbox"] = True
-    entitlements = os.path.join(ctx.art, "MAS-Entitlements.plist")
-    with open(entitlements, "wb") as f:
-        plistlib.dump(values, f)
-    embedded = os.path.join(app, "Contents", "embedded.provisionprofile")
-    if os.path.lexists(embedded):
-        os.unlink(embedded)
-    shutil.copyfile(profile_path, embedded)
+    with tempfile.TemporaryDirectory(prefix="mas-pkg-", dir=ctx.art) as tmp:
+        snapshot = os.path.join(tmp, "profile.provisionprofile")
+        with open(profile_path, "rb") as source_profile, open(snapshot, "xb") as private_profile:
+            os.fchmod(private_profile.fileno(), 0o600)
+            shutil.copyfileobj(source_profile, private_profile, 1 << 20)
+        profile, app_identifier = mas_profile(ctx, snapshot, team, bundle, app_hash)
+        managed = {"com.apple.application-identifier": app_identifier, "com.apple.developer.team-identifier": team}
+        for key, value in managed.items():
+            if key in values and values[key] != value:
+                raise ctx.Fail("MAS identity entitlements must match the provisioning profile: " + key)
+        values.update(managed)
+        values["com.apple.security.app-sandbox"] = True
+        mas_authorize_entitlements(ctx, values, profile["Entitlements"])
+        entitlements = os.path.join(ctx.art, "MAS-Entitlements.plist")
+        with open(entitlements, "wb") as f:
+            plistlib.dump(values, f)
+        embedded = os.path.join(app, "Contents", "embedded.provisionprofile")
+        if os.path.lexists(embedded):
+            os.unlink(embedded)
+        shutil.copyfile(snapshot, embedded)
     flags = ["--options", "runtime"] if ctx.p.get("hardened_runtime") else []
     for path in mas_code_paths(app) + [app]:
         ctx.run(["codesign", "--force", "--sign", app_hash] + flags +

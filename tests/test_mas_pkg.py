@@ -17,6 +17,9 @@ from test_unity import FakeContext, kinds
 
 
 class ToolContext(FakeContext):
+    class Cancelled(Exception):
+        pass
+
     def run(self, cmd, **kwargs):
         self.calls.append((cmd, kwargs))
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -45,6 +48,7 @@ class MasPkgTests(unittest.TestCase):
         self.journal = self.root / 'commands.jsonl'
         self.ctx = ToolContext(self.root, {'from_job': 'source-job', 'app': 'Example.app', 'profile': 'store.provisionprofile'})
         self.ctx.cfg = {'team_id': 'ABCDE12345', 'mas_profiles_dir': str(self.root / 'profiles')}
+        self.ctx.cancel_file = str(self.root / 'cancel')
         self.ctx.target, self.ctx.device = 'macos', None
         self.inputs = self.root / 'inputs'
         self.inputs.mkdir()
@@ -73,6 +77,9 @@ class MasPkgTests(unittest.TestCase):
                         'ExpirationDate': datetime.datetime(2099, 1, 1), 'DeveloperCertificates': [self.cert],
                         'Entitlements': {'com.apple.application-identifier': 'ABCDE12345.com.example.game',
                                          'com.apple.developer.team-identifier': 'ABCDE12345', 'get-task-allow': False,
+                                         'com.apple.security.app-sandbox': True,
+                                         'com.apple.security.network.client': True,
+                                         'com.apple.security.cs.allow-jit': True,
                                          'com.apple.developer.game-center': True}}
         Path(self.ctx.cfg['mas_profiles_dir']).mkdir()
         self.profile_file = Path(self.ctx.cfg['mas_profiles_dir']) / 'store.provisionprofile'
@@ -201,10 +208,7 @@ if 'build' in sys.argv:
         mutations = [({'Platform': ['iOS']}, {}), ({'TeamIdentifier': ['ZZZZZ12345']}, {}),
                      ({'ExpirationDate': datetime.datetime(2000, 1, 1)}, {}), ({'DeveloperCertificates': [b'wrong']}, {}),
                      ({'ProvisionedDevices': []}, {}), ({'ProvisionsAllDevices': True}, {}),
-                     ({}, {'get-task-allow': True}), ({}, {'com.apple.security.get-task-allow': True}),
-                     ({}, {'com.apple.application-identifier': 'ABCDE12345.com.other.game'}),
-                     ({}, {'com.apple.application-identifier': 'ABCDE12345.com.ex*'}),
-                     ({}, {'com.apple.developer.team-identifier': 'ZZZZZ12345'})]
+                     ({}, {'get-task-allow': True}), ({}, {'com.apple.security.get-task-allow': True})]
         for fields, ent in mutations:
             self.profile = plistlib.loads(original)
             self.profile.update(fields)
@@ -226,9 +230,165 @@ if 'build' in sys.argv:
         self.profile['Entitlements'].pop('com.apple.developer.game-center')
         self.save_profile()
         self.ctx.p['entitlement_values'] = {'com.apple.developer.game-center': True}
-        with self.assertRaisesRegex(self.ctx.Fail, 'authorize Game Center'):
+        with self.assertRaisesRegex(self.ctx.Fail, 'authorize entitlement: com.apple.developer.game-center'):
             kinds.k_mas_pkg(self.ctx)
         self.assertEqual(self.commands('codesign'), [])
+
+    def test_every_effective_entitlement_requires_profile_authorization(self):
+        for key, granted in (('com.apple.security.network.client', None),
+                             ('com.apple.security.network.client', False),
+                             ('com.apple.security.app-sandbox', None),
+                             ('com.apple.security.app-sandbox', False),
+                             ('com.apple.developer.team-identifier', 'ZZZZZ12345'),
+                             ('com.apple.developer.team-identifier', None),
+                             ('com.apple.application-identifier', None),
+                             ('com.apple.application-identifier', 'ABCDE12345.com.other.game'),
+                             ('com.apple.application-identifier', 'ABCDE12345.com.ex*')):
+            with self.subTest(key=key, granted=granted):
+                original = self.profile['Entitlements'].copy()
+                if granted is None:
+                    self.profile['Entitlements'].pop(key)
+                else:
+                    self.profile['Entitlements'][key] = granted
+                self.save_profile()
+                self.ctx.p['entitlement_values'] = {'com.apple.security.network.client': True}
+                try:
+                    with self.assertRaisesRegex(self.ctx.Fail, 'authorize entitlement: ' + key):
+                        kinds.k_mas_pkg(self.ctx)
+                    self.assertEqual(self.commands('codesign'), [])
+                    self.assertFalse(Path(self.ctx.art, 'MAS-Entitlements.plist').exists())
+                    self.assertEqual(list(Path(self.ctx.art).glob('mas-pkg-*')), [])
+                finally:
+                    self.profile['Entitlements'] = original
+                    kinds.remove_collect_copy(str(Path(self.ctx.art, 'Example.app')))
+
+    def test_authorization_checks_array_subset_and_boolean_types(self):
+        key = 'example.array'
+        kinds.mas_authorize_entitlements(self.ctx, {key: ['one']}, {key: ['one', 'two']})
+        kinds.mas_authorize_entitlements(self.ctx, {'example.bool': False}, {'example.bool': True})
+        for requested, allowed in ((['three'], ['one', 'two']), ([True], [1]), (['one'], 'one')):
+            with self.subTest(requested=requested, allowed=allowed), self.assertRaisesRegex(self.ctx.Fail, key):
+                kinds.mas_authorize_entitlements(self.ctx, {key: requested}, {key: allowed})
+        with self.assertRaisesRegex(self.ctx.Fail, 'example.bool'):
+            kinds.mas_authorize_entitlements(self.ctx, {'example.bool': True}, {'example.bool': 1})
+
+    def test_profile_snapshot_embeds_exact_validated_bytes_after_source_replacement(self):
+        self.profile['Entitlements']['com.apple.application-identifier'] = 'ABCDE12345.*'
+        self.save_profile()
+        expected = self.profile_file.read_bytes()
+        validated, snapshots = [], []
+        run = self.ctx.run
+
+        def replace_source(cmd, **kwargs):
+            result = run(cmd, **kwargs)
+            if cmd[:3] == ['security', 'cms', '-D']:
+                snapshot = Path(cmd[cmd.index('-i') + 1])
+                self.assertNotEqual(snapshot, self.profile_file)
+                self.assertEqual(snapshot.parent.parent, Path(self.ctx.art))
+                self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+                validated.append(snapshot.read_bytes())
+                snapshots.append(snapshot)
+                self.profile_file.unlink()
+                self.profile_file.write_bytes(b'replacement-not-validated')
+            return result
+
+        with patch.object(self.ctx, 'run', side_effect=replace_source):
+            kinds.k_mas_pkg(self.ctx)
+        self.assertEqual(validated, [expected])
+        self.assertEqual(Path(self.ctx.art, 'Example.app/Contents/embedded.provisionprofile').read_bytes(), validated[0])
+        self.assertTrue(all(not path.exists() for path in snapshots))
+        ent = plistlib.loads(Path(self.ctx.art, 'MAS-Entitlements.plist').read_bytes())
+        self.assertEqual(ent['com.apple.application-identifier'], 'ABCDE12345.com.example.game')
+
+    def test_intermediate_directory_swap_during_copy_never_reads_external_app(self):
+        output = self.inputs / 'out'
+        (output / 'build').mkdir(parents=True)
+        self.app.rename(output / 'build/Example.app')
+        self.ctx.p['app'] = 'out/build/Example.app'
+        outside = self.root / 'outside'
+        (outside / 'Example.app').mkdir(parents=True)
+        (outside / 'Example.app/external').write_bytes(b'external-private-content')
+        open_fd = os.open
+        swapped = []
+
+        def swap(name, flags, *args, **kwargs):
+            if name == 'build' and 'dir_fd' in kwargs:
+                self.assertTrue(flags & os.O_NOFOLLOW)
+                self.assertTrue(flags & os.O_DIRECTORY)
+                (output / 'build').rename(output / 'original-build')
+                (output / 'build').symlink_to(outside, target_is_directory=True)
+                swapped.append(name)
+            return open_fd(name, flags, *args, **kwargs)
+
+        with patch.object(kinds.os, 'open', side_effect=swap), \
+                patch.object(kinds.os, 'read', wraps=os.read) as read, \
+                self.assertRaisesRegex(self.ctx.Fail, 'MAS app source changed'):
+            kinds.k_mas_pkg(self.ctx)
+        self.assertEqual(swapped, ['build'])
+        read.assert_not_called()
+        self.assertEqual(list(Path(self.ctx.art).iterdir()), [])
+        self.assertEqual(self.commands(), [])
+        self.assertEqual((outside / 'Example.app/external').read_bytes(), b'external-private-content')
+
+    def test_cancel_and_timeout_mid_copy_remove_partial_app(self):
+        payload = b'x' * (2 * 1024 * 1024)
+        (self.app / 'Contents/MacOS/Example').write_bytes(payload)
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                clock, reads = [40], []
+                read = os.read
+
+                def stop_copy(fd, size):
+                    chunk = read(fd, size)
+                    if os.fstat(fd).st_size == len(payload):
+                        reads.append(len(chunk))
+                        if len(reads) == 2:
+                            self.assertEqual(Path(self.ctx.art, 'Example.app/Contents/MacOS/Example').stat().st_size,
+                                             1024 * 1024)
+                            if cancel:
+                                Path(self.ctx.cancel_file).touch()
+                            else:
+                                clock[0] += kinds.DEFAULT_STEP_TIMEOUT + 1
+                    return chunk
+
+                with patch.object(kinds.os, 'read', side_effect=stop_copy), \
+                        patch.object(kinds.time, 'monotonic', side_effect=lambda: clock[0]), \
+                        self.assertRaises(self.ctx.Cancelled if cancel else self.ctx.Fail) as failure:
+                    kinds.k_mas_pkg(self.ctx)
+                if not cancel:
+                    self.assertIn('timed out', str(failure.exception))
+                self.assertEqual(reads, [1024 * 1024, 1024 * 1024])
+                self.assertEqual(list(Path(self.ctx.art).iterdir()), [])
+                self.assertEqual(self.commands(), [])
+                self.assertEqual((self.app / 'Contents/MacOS/Example').read_bytes(), payload)
+                Path(self.ctx.cancel_file).unlink(missing_ok=True)
+
+    def test_cancel_and_capped_deadline_during_tree_validation_clean_up(self):
+        for cancel in (False, True):
+            for relative in ('Contents/MacOS', 'Contents/MacOS/Example'):
+                with self.subTest(cancel=cancel, relative=relative):
+                    clock, checked = [40], []
+                    self.ctx.unity_deadline = 100
+                    validate = kinds.validate_collect_tree
+
+                    def stop_validation(ctx, root, path, active=None, check=None):
+                        self.assertIsNotNone(check)
+                        if os.path.realpath(path) == os.path.realpath(os.path.join(root, relative)):
+                            checked.append(path)
+                            if cancel:
+                                Path(ctx.cancel_file).touch()
+                            else:
+                                clock[0] = 101
+                        return validate(ctx, root, path, active, check)
+
+                    with patch.object(kinds, 'validate_collect_tree', side_effect=stop_validation), \
+                            patch.object(kinds.time, 'monotonic', side_effect=lambda: clock[0]), \
+                            self.assertRaises(self.ctx.Cancelled if cancel else self.ctx.Fail):
+                        kinds.k_mas_pkg(self.ctx)
+                    self.assertEqual(len(checked), 1)
+                    self.assertEqual(list(Path(self.ctx.art).iterdir()), [])
+                    self.assertEqual(self.commands(), [])
+                    Path(self.ctx.cancel_file).unlink(missing_ok=True)
 
     def test_paths_stay_in_artifacts_and_configured_profiles_directory(self):
         for key in ('app', 'profile', 'entitlements'):
