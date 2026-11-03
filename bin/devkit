@@ -11,10 +11,10 @@ JOBS, WORK, ARTIFACTS, DERIVED, INPUTS = (os.path.join(ROOT, d) for d in ("jobs"
 CONFIG = os.path.join(ROOT, "config.json")
 LOCK = os.path.join(ROOT, "worker.lock")
 KINDS = tuple(sorted(devkit_kinds.KINDS))
-NO_CHECKOUT_KINDS = ("echo", "screenshot", "crashlogs", "launch", "aab-sign")
+NO_CHECKOUT_KINDS = ("echo", "screenshot", "crashlogs", "launch", "aab-sign", "mas-pkg")
 UNITY_EDITORS = devkit_kinds.UNITY_EDITORS
 PROFILES_DIR = os.path.expanduser("~/Library/Developer/Xcode/UserData/Provisioning Profiles")
-DEFAULT_STEP_TIMEOUT = 3 * 3600
+DEFAULT_STEP_TIMEOUT = devkit_kinds.DEFAULT_STEP_TIMEOUT
 PROCESS_STOP_GRACE = 1.0
 UNITY_SLOT = os.path.expanduser("~/.local/state/devkit/unity.lock")
 DISPLAY_KINDS = ("launch", "profile", "screenshot", "deploy", "test")  # simulator / Instruments need the display awake
@@ -676,6 +676,13 @@ def queue_locked(a):
             raise Fail(str(e)) from None
         if a.target != "android":
             raise Fail("aab-sign target must be android")
+    if a.kind == "mas-pkg":
+        try:
+            devkit_kinds.validate_mas_pkg_params(params)
+        except ValueError as e:
+            raise Fail(str(e)) from None
+        if a.target != "macos":
+            raise Fail("mas-pkg target must be macos")
     jobs = all_jobs()
     jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     os.makedirs(os.path.join(JOBS, jid))

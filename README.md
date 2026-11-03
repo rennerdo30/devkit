@@ -111,7 +111,7 @@ Other MCP clients can use the endpoint directly: `POST <host>:7420/mcp` with `Au
 | CLI | `bin/devkit <verb>` (`ping`, `queue`, `status`, `list`, `log`, `cancel`, `artifacts`, `devices`, `simulators`, `signing`, `kinds`) |
 
 Job kinds: `build`, `test`, `archive`, `release`, `notarize`, `deploy`, `launch`, `profile`, `screenshot`, `crashlogs`,
-`unity`, `unity-test`, `aab-sign`, `shell`, `echo`. `GET /api/kinds` documents their parameters.
+`unity`, `unity-test`, `aab-sign`, `mas-pkg`, `shell`, `echo`. `GET /api/kinds` documents their parameters.
 
 ## Unity builds, compile gates and tests (0.6.0)
 
@@ -200,6 +200,20 @@ Queue `archive` with `target: "ios"` and params such as
 `{"from_job":"SOURCE_JOB_ID","project":"iOS/Unity-iPhone.xcodeproj","scheme":"Unity-iPhone","export_method":"app-store-connect"}`
 to produce an IPA. Automatic provisioning and the configured `asc_api_key` authentication continue to work as before.
 
+tvOS exports work the same way. Collect the Unity `tvOS` directory (containing `Unity-iPhone.xcodeproj`,
+scheme `Unity-iPhone`), then queue:
+
+```json
+{"project":"example","commit":"none","kind":"archive","target":"tvos",
+ "params":{"from_job":"SOURCE_JOB_ID","project":"tvOS/Unity-iPhone.xcodeproj",
+           "scheme":"Unity-iPhone","export_method":"app-store-connect","team_id":"ABCDE12345"}}
+```
+
+`build` also accepts `target: "tvos"` and retains the built app. tvOS archives use `generic/platform=tvOS`.
+Both commands use the same automatic signing, `-allowProvisioningUpdates` and host `asc_api_key` authentication
+as iOS. The export stays local; this example does not upload to App Store Connect. tvOS simulator and device
+installation/launch flows are not included.
+
 An owner can allow environment values for all Unity Editor runs in host `config.json`:
 
 ```json
@@ -240,6 +254,77 @@ temporary ZIP for `dump xmltree`; it does not dump the AAB directly. The report 
 Unavailable or invalid identity fields stay null with a `manifest_note`; parsed `minSdk`/`targetSdk` integers are
 also included when available. If neither tool is available, identity fields and `manifest_source` remain null
 with a skip note. This kind signs locally and does not upload to a store.
+
+### Mac App Store packages
+
+Collect a Unity macOS `.app` (for example with `build_target: "StandaloneOSX"` and
+`collect: ["Builds/macOS"]`), then queue a standalone package job on the same host:
+
+```json
+{"project":"example","commit":"none","kind":"mas-pkg","target":"macos",
+ "params":{"from_job":"SOURCE_JOB_ID","app":"macOS/Example.app","profile":"example-store.provisionprofile",
+           "entitlement_values":{"com.apple.developer.game-center":true,
+                                 "com.apple.security.network.client":true}}}
+```
+
+The host owner configures `config.json` (paths here are placeholders):
+
+```json
+{"team_id":"ABCDE12345","mas_profiles_dir":"/path/to/mas-profiles"}
+```
+
+`params.team_id` overrides the host team. `params.profile` is a relative file under `mas_profiles_dir`;
+absolute paths, traversal and escapes through symlinks are rejected. Obtain the profile in the
+[Developer portal](https://developer.apple.com/help/account/provisioning-profiles/create-an-app-store-provisioning-profile):
+Profiles → Mac App Store Connect → the app's App ID, with Game Center enabled if requested, selecting the host's
+Apple Distribution certificate. Alternatively use Xcode's account settings → Download Manual Profiles.
+Copy the downloaded profile into `mas_profiles_dir`. This kind uses that profile; it does not create/download
+one through the ASC API or infer provisioning from an arbitrary `.app` without Xcode project context.
+
+The profile is CMS-decoded and checked for macOS App Store distribution (no device list, all-device distribution
+or debugging), expiry, team, bundle ID and the selected signing certificate. A final `.*` App ID wildcard is
+expanded to the app's bundle ID; other wildcard forms fail. The profile must authorize Game Center when enabled.
+The original profile is embedded at `Contents/embedded.provisionprofile` before signing a private app copy.
+
+The host keychain needs **Apple Distribution** (app signing) and **Mac Installer Distribution** (package signing)
+certificates **with their private keys**. The latter may appear as `3rd Party Mac Developer Installer`.
+`security find-identity` must yield exactly one valid identity of each type for the team; missing or ambiguous
+matches fail. Developer ID certificates are not accepted. Certificate subject names and tool output stay out of
+job logs and reports; only authority types are reported.
+
+An Admin ASC key with the required certificate permissions can use
+[cloud-managed signing for Xcode exports](https://developer.apple.com/help/account/certificates/cloud-managed-certificates).
+Standalone `codesign` and `productbuild` need local identities; a cloud certificate alone does not supply a local
+private key. An owner can first export a macOS archive using `xcodebuild -exportArchive` with an
+`-exportOptionsPlist` containing `method: app-store-connect`, `signingStyle: automatic`, and the team, plus
+`-allowProvisioningUpdates` and ASC authentication. Xcode can provision distribution signing with suitable account
+permissions; ensure the installer identity and its private key are actually in the host keychain afterwards.
+For explicit local setup, create a CSR using Keychain Access, create **Mac Installer Distribution** in Developer
+portal → Certificates, download and import the certificate on the Mac that owns that CSR's private key. Provision
+Apple Distribution locally in the same way (or import a securely transferred certificate/private-key identity).
+See Apple's [Mac packaging guide](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution).
+
+App Sandbox (`com.apple.security.app-sandbox=true`) is always included. `entitlement_values` explicitly opts into
+boolean capabilities: `com.apple.developer.game-center`, `com.apple.security.cs.allow-jit`,
+`com.apple.security.network.client`, `com.apple.security.network.server`,
+`com.apple.security.files.user-selected.read-write`, `com.apple.security.files.user-selected.read-only`,
+`com.apple.security.device.audio-input`, `com.apple.security.device.camera`, `com.apple.security.device.usb`,
+and `com.apple.security.print`. No extra capabilities are enabled by default. Unknown keys and both forms of
+`get-task-allow` are rejected even when false. Additional capabilities require an explicit change to this allowlist.
+
+Instead of `entitlement_values`, supply `entitlements: "relative/entitlements.plist"` from the source job's artifacts.
+The same allowlist applies; disabling sandbox fails. Optional `com.apple.application-identifier` and
+`com.apple.developer.team-identifier` in a supplied plist must match the profile-derived identity. Otherwise these
+identity entitlements are generated. `hardened_runtime: true` enables runtime signing options; it defaults to false.
+Entitlements are applied only to the main app. Mach-O code and enclosing code bundles are signed inside-out,
+then `productbuild --component <app> /Applications --sign <installer-identity> out.pkg` packages it.
+
+A successful `pkgutil --check-signature out.pkg` is required before `mas-pkg.json` is written. The report records
+`path`, SHA-256, byte size, bundle ID, version, build, app and installer authority types, team, profile name/UUID
+and sorted entitlement keys. The effective plist is also retained as `MAS-Entitlements.plist`.
+This checks local profile compatibility and package signing; it does not prove App Store acceptance or launchability.
+Gatekeeper `spctl`, `codesign --verify --deep --strict`, notarization and launch smoke tests are not run for this MAS
+workflow. Upload/validation in App Store Connect remains a separate owner-operated step.
 
 ### Tests
 

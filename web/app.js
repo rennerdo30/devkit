@@ -25,8 +25,8 @@ const T = {
     copy: "Copy", copied: "Copied", done: "Done", ownerToken: "From config.json on the Mac", you: "you",
     st: { running: "Running", queued: "Waiting", succeeded: "Succeeded", failed: "Failed", cancelled: "Cancelled" },
     k: { build: "Build", test: "Test", deploy: "Install", launch: "Launch", profile: "Profile", screenshot: "Screenshot", archive: "Archive",
-         release: "Release", notarize: "Notarize", crashlogs: "Crash logs", unity: "Unity build", "aab-sign": "Sign Android AAB", shell: "Shell", echo: "Echo" },
-    tg: { ios: "iPhone / iPad", "ios-sim": "Simulator", macos: "Mac", android: "Android" },
+         release: "Release", notarize: "Notarize", crashlogs: "Crash logs", unity: "Unity build", "aab-sign": "Sign Android AAB", "mas-pkg": "Mac App Store package", shell: "Shell", echo: "Echo" },
+    tg: { tvos: "Apple TV", ios: "iPhone / iPad", "ios-sim": "Simulator", macos: "Mac", android: "Android" },
     nowRunning: "Running now", nothingWaiting: "Nothing is waiting.", waitingN: "{n} waiting", idleTitle: "Nothing is running", idleText: "The Mac is free. Start something:", upNext: "Up next",
     recent: "Recent results", agents: "Connected", noAgents: "Nobody else is connected.", vitals: "Mac right now", feed: "What happened",
     noFeed: "Nothing has happened yet.", openJob: "Open job", stepOf: "step {a} of {b}", elapsed: "elapsed", took: "took", ago: "ago",
@@ -109,8 +109,8 @@ const T = {
     copy: "Kopieren", copied: "Kopiert", done: "Fertig", ownerToken: "Aus config.json auf dem Mac", you: "du",
     st: { running: "Läuft", queued: "Wartet", succeeded: "Erfolgreich", failed: "Fehlgeschlagen", cancelled: "Abgebrochen" },
     k: { build: "Build", test: "Test", deploy: "Installieren", launch: "Starten", profile: "Profilieren", screenshot: "Bildschirmfoto", archive: "Archivieren",
-         release: "Veröffentlichen", notarize: "Notarisieren", crashlogs: "Absturzberichte", unity: "Unity-Build", "aab-sign": "Android-AAB signieren", shell: "Shell", echo: "Echo" },
-    tg: { ios: "iPhone / iPad", "ios-sim": "Simulator", macos: "Mac", android: "Android" },
+         release: "Veröffentlichen", notarize: "Notarisieren", crashlogs: "Absturzberichte", unity: "Unity-Build", "aab-sign": "Android-AAB signieren", "mas-pkg": "Mac App Store-Paket", shell: "Shell", echo: "Echo" },
+    tg: { tvos: "Apple TV", ios: "iPhone / iPad", "ios-sim": "Simulator", macos: "Mac", android: "Android" },
     nowRunning: "Läuft gerade", nothingWaiting: "Nichts wartet.", waitingN: "{n} wartend", idleTitle: "Nichts läuft", idleText: "Der Mac ist frei. Etwas starten:", upNext: "Als Nächstes",
     recent: "Letzte Ergebnisse", agents: "Verbunden", noAgents: "Sonst ist niemand verbunden.", vitals: "Mac gerade", feed: "Was passiert ist",
     noFeed: "Noch ist nichts passiert.", openJob: "Job öffnen", stepOf: "Schritt {a} von {b}", elapsed: "vergangen", took: "Dauer", ago: "her",
@@ -268,7 +268,7 @@ function jref(ref) {
 const jobHash = r => "#/jobs/" + r.id + (r.host && S.me && r.host !== S.me.host ? "@" + encodeURIComponent(r.host) : "");
 const canOperate = () => S.me && S.me.role !== "viewer";
 const isAdmin = () => S.me && S.me.role === "admin";
-const PLATFORM_OF = { ios: "macos", "ios-sim": "macos", macos: "macos" };
+const PLATFORM_OF = { tvos: "macos", ios: "macos", "ios-sim": "macos", macos: "macos" };
 function hostOptions(target) {
   const want = PLATFORM_OF[target] || "macos";
   const ok = S.hosts.filter(h => h.online && h.platform === want);
@@ -885,13 +885,13 @@ const foot = label => `<div class="dlg-foot"><span class="dlg-err err" role="ale
 
 /* What each project action asks for and how it maps onto a job. */
 const RUN = {
-  build:      { kind: "build", targets: ["ios", "ios-sim", "macos"], fields: ["ref", "target", "device", "configuration"], generic: true },
+  build:      { kind: "build", targets: ["ios", "ios-sim", "tvos", "macos"], fields: ["ref", "target", "device", "configuration"], generic: true },
   install:    { kind: "deploy", targets: ["ios", "ios-sim", "macos"], fields: ["ref", "target", "device", "launch_args", "duration"], extra: { launch: true } },
   launch:     { kind: "launch", targets: ["ios", "ios-sim"], fields: ["target", "device", "launch_args", "duration"], noRepo: true },
   profile:    { kind: "profile", targets: ["ios", "ios-sim", "macos"], fields: ["target", "device", "template", "duration", "launch_args"], noRepo: true },
   test:       { kind: "test", targets: ["ios-sim", "macos", "ios"], fields: ["ref", "target", "device"] },
   screenshot: { kind: "screenshot", targets: ["ios", "ios-sim"], fields: ["target", "device"], noRepo: true },
-  archive:    { kind: "archive", targets: ["ios", "macos"], fields: ["ref", "target", "export_method"] },
+  archive:    { kind: "archive", targets: ["ios", "tvos", "macos"], fields: ["ref", "target", "export_method"] },
   release:    { kind: "release", targets: ["ios", "macos"], fields: ["ref", "target"] },
   unity:      { kind: "unity", targets: [], fields: ["ref", "unity_mode", "unity_method", "unity_target", "unity_quit", "test_platform", "test_filter", "assembly_names", "unity_graphics", "unity_timeout"] },
   shell:      { kind: "shell", targets: [], fields: ["ref", "args"] },
@@ -999,9 +999,9 @@ function openProject(p) {
       ${field("scheme", t("scheme"), input("scheme", v("scheme")))}
       ${field("bundle_id", t("pBundle"), input("bundle_id", v("bundle_id"), 'placeholder="com.example.game"'))}
       ${field("team_id", t("pTeam"), input("team_id", v("team_id")))}
-      ${field("target", t("pTarget"), select("target", [["ios", tname("ios")], ["ios-sim", tname("ios-sim")], ["macos", tname("macos")]], v("target") || "ios"))}
+      ${field("target", t("pTarget"), select("target", [["ios", tname("ios")], ["ios-sim", tname("ios-sim")], ["tvos", tname("tvos")], ["macos", tname("macos")]], v("target") || "ios"))}
       ${field("device", t("pDevice"), select("device", [["", "–"]].concat(deviceOptions("ios"), deviceOptions("ios-sim")), v("device")))}
-      ${field("unity_build_target", t("pUnityTarget"), select("unity_build_target", [["", "–"], ["iOS", "iOS"], ["OSXUniversal", "macOS"], ["Android", "Android"], ["WebGL", "WebGL"]], v("unity_build_target")))}
+      ${field("unity_build_target", t("pUnityTarget"), select("unity_build_target", [["", "–"], ["iOS", "iOS"], ["tvOS", "tvOS"], ["OSXUniversal", "macOS"], ["Android", "Android"], ["WebGL", "WebGL"]], v("unity_build_target")))}
       ${field("unity_method", t("pUnityMethod"), input("unity_method", v("unity_method"), 'placeholder="BuildScript.BuildiOS"'))}
       ${field("notes", t("pNotes"), `<textarea id="f-notes" name="notes">${esc(v("notes"))}</textarea>`, { full: true })}
     </div>${foot(p ? t("save") : t("create"))}`, async form => {
@@ -1124,7 +1124,7 @@ function openCustom() {
       ${field("project", t("projectName"), input("project", "", 'required pattern="[A-Za-z0-9._\\-]+"'))}
       ${field("repo", t("pRepo"), input("repo", ""), { full: true })}
       ${field("commit", t("branch"), input("commit", "none", 'required'))}
-      ${field("target", t("target"), select("target", [["", "–"], ["ios", tname("ios")], ["ios-sim", tname("ios-sim")], ["macos", tname("macos")], ["android", tname("android")]], ""))}
+      ${field("target", t("target"), select("target", [["", "–"], ["ios", tname("ios")], ["ios-sim", tname("ios-sim")], ["tvos", tname("tvos")], ["macos", tname("macos")], ["android", tname("android")]], ""))}
       ${field("device", t("device"), select("device", [["", "–"]].concat(deviceOptions("ios"), deviceOptions("ios-sim")), ""), { full: true })}
       ${field("args", t("command"), `<textarea id="f-args" name="args" spellcheck="false"></textarea>`, { full: true })}
       ${field("params", t("params"), `<textarea id="f-params" name="params" spellcheck="false" placeholder='{"scheme": "Game"}'></textarea>`, { full: true, hint: "" })}

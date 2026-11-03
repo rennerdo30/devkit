@@ -11,22 +11,27 @@ Unity params: project_dir (repo-relative, default root), collect (repo-relative 
   args (conservative project-specific argv). Host config unity_env supplies Editor environment variables.
 aab-sign params: from_job, aab (relative artifact path), keystore_path (host file outside checkout),
   alias, keychain_service, keychain_account. Passwords are read from Keychain only at execution time.
-Targets (job "target"): ios (device), ios-sim, macos; android for aab-sign.
+mas-pkg params: from_job, app, profile (relative to host mas_profiles_dir), optional entitlements
+  (source artifact plist), entitlement_values (explicit boolean allowlist), team_id, hardened_runtime.
+Targets (job "target"): ios (device), ios-sim, tvos, macos; android for aab-sign.
 """
+import datetime
 import glob, hashlib, json, math, os, plistlib, re, shutil, stat, subprocess, tempfile, time, zipfile
 import xml.etree.ElementTree as ET
 
 XCODE_TARGETS = ("ios", "ios-sim", "macos")
-TARGETS = XCODE_TARGETS + ("android",)
+BUILD_TARGETS = XCODE_TARGETS + ("tvos",)
+TARGETS = BUILD_TARGETS + ("android",)
 UNITY_EDITORS = "/Applications/Unity/Hub/Editor"
 DEFAULT_TEMPLATE = "Time Profiler"
 DEFAULT_PROFILE_SECONDS = 30
 DEFAULT_LAUNCH_SECONDS = 60
 UNITY_MAX_TIMEOUT = 4 * 3600
+DEFAULT_STEP_TIMEOUT = 3 * 3600
 # Fixed runner/kind outputs must never be supplied by collect, even before they exist.
 RESERVED_ARTIFACT_NAMES = frozenset(name.casefold() for name in (
     "job.log", "job.json", "TestResults.xml", "test-summary.json", "echo.txt",
-    "profile-summary.json", "aab-sign.json"))
+    "profile-summary.json", "aab-sign.json", "mas-pkg.json", "MAS-Entitlements.plist"))
 UNITY_PARAMS = {
     "project_dir": {"type": "string", "description": "Repo-relative Unity directory containing ProjectSettings/ProjectVersion.txt; defaults to repo root."},
     "collect": {"type": "array", "items": {"type": "string"}, "description": "Repo-relative outputs copied into artifacts by last path component after success."},
@@ -331,13 +336,15 @@ def xcodebuild(ctx, *action, configuration="Debug", destination=None, auth=True)
 def destination(ctx, generic=False):
     if ctx.target == "macos":
         return "generic/platform=macOS" if generic else "platform=macOS"
+    if ctx.target == "tvos":
+        return "generic/platform=tvOS" if generic or not ctx.device else "id=" + ctx.device
     if ctx.target == "ios-sim":
         return "generic/platform=iOS Simulator" if generic or not ctx.device else "platform=iOS Simulator,id=" + ctx.device
     return "generic/platform=iOS" if generic or not ctx.device else "id=" + ctx.device
 
 
 def built_app(ctx, configuration):
-    sdk = {"ios": "iphoneos", "ios-sim": "iphonesimulator"}.get(ctx.target)
+    sdk = {"ios": "iphoneos", "ios-sim": "iphonesimulator", "tvos": "appletvos"}.get(ctx.target)
     folder = configuration + ("-" + sdk if sdk else "")
     apps = sorted(glob.glob(os.path.join(ctx.derived, "Build", "Products", folder, "*.app")), key=os.path.getmtime)
     if not apps:
@@ -377,7 +384,7 @@ def k_shell(ctx):
 
 def k_build(ctx):
     """xcodebuild build for the target (and device, if given); the .app is copied to artifacts."""
-    need_target(ctx)
+    need_target(ctx, BUILD_TARGETS)
     conf = config_name(ctx, "Debug")
     xcodebuild(ctx, "build", configuration=conf, destination=destination(ctx))
     ctx.run(["ditto", built_app(ctx, conf), os.path.join(ctx.art, os.path.basename(built_app(ctx, conf)))])
@@ -402,8 +409,9 @@ def export(ctx, archive_path, method, upload=False):
     if method not in EXPORT_METHODS:
         raise ctx.Fail("export_method must be one of: " + ", ".join(EXPORT_METHODS))
     opts = {"method": method, "signingStyle": "automatic", "destination": "upload" if upload else "export"}
-    if ctx.p.get("team_id"):
-        opts["teamID"] = ctx.p["team_id"]
+    team = ctx.p.get("team_id") or ctx.cfg.get("team_id")
+    if team:
+        opts["teamID"] = team
     plist = os.path.join(ctx.art, "ExportOptions.plist")
     with open(plist, "wb") as f:
         plistlib.dump(opts, f)
@@ -415,7 +423,7 @@ def export(ctx, archive_path, method, upload=False):
 
 def k_archive(ctx):
     """Archive (signed, Release); optional params.export_method exports an .ipa / .app."""
-    need_target(ctx, ("ios", "macos"))
+    need_target(ctx, ("ios", "tvos", "macos"))
     path = archive(ctx)
     if ctx.p.get("export_method"):
         export(ctx, path, ctx.p["export_method"])
@@ -952,6 +960,291 @@ def k_aab_sign(ctx):
                "signer_cert_sha256": fingerprints[0].replace(":", "").lower()}
     summary.update(aab_manifest(ctx, aab))
     ctx.write("aab-sign.json", json.dumps(summary, indent=2))
+
+
+# Standalone Mac App Store packaging deliberately uses owner-provisioned profiles.
+# An ASC key alone cannot provision an arbitrary Unity .app without project context.
+MAS_ENTITLEMENTS = frozenset((
+    "com.apple.security.app-sandbox", "com.apple.developer.game-center",
+    "com.apple.security.cs.allow-jit", "com.apple.security.network.client",
+    "com.apple.security.network.server", "com.apple.security.files.user-selected.read-write",
+    "com.apple.security.files.user-selected.read-only", "com.apple.security.device.audio-input",
+    "com.apple.security.device.camera", "com.apple.security.device.usb",
+    "com.apple.security.print"))
+MAS_ID_ENTITLEMENTS = frozenset(("com.apple.application-identifier", "com.apple.developer.team-identifier"))
+MAS_PKG_PARAMS = {
+    "from_job": {"type": "string", "description": "Succeeded Unity macOS source job on this host."},
+    "app": {"type": "string", "description": "Relative .app directory inside source artifacts."},
+    "profile": {"type": "string", "description": "Mac App Store profile relative to host mas_profiles_dir."},
+    "entitlements": {"type": "string", "description": "Optional entitlement plist relative to source artifacts."},
+    "entitlement_values": {"type": "object", "properties": {k: {"type": "boolean"} for k in sorted(MAS_ENTITLEMENTS)},
+                           "additionalProperties": False, "description": "Explicit entitlements when no plist is supplied. Sandbox is always required."},
+    "team_id": {"type": "string", "pattern": "^[A-Z0-9]{10}$"},
+    "hardened_runtime": {"type": "boolean", "default": False},
+}
+
+
+def validate_mas_entitlements(values):
+    if not isinstance(values, dict) or set(values) - MAS_ENTITLEMENTS - MAS_ID_ENTITLEMENTS:
+        raise ValueError("unknown or forbidden MAS entitlement (get-task-allow is never allowed)")
+    if any(type(v) is not bool for k, v in values.items() if k in MAS_ENTITLEMENTS):
+        raise ValueError("MAS capability entitlements must be boolean")
+    if values.get("com.apple.security.app-sandbox", True) is not True:
+        raise ValueError("MAS requires com.apple.security.app-sandbox=true")
+
+
+def validate_mas_pkg_params(params):
+    if not isinstance(params, dict) or set(params) - set(MAS_PKG_PARAMS):
+        raise ValueError("unknown mas-pkg params")
+    for key in ("from_job", "app", "profile"):
+        if not isinstance(params.get(key), str) or not params[key]:
+            raise ValueError("mas-pkg requires " + key)
+    for key in ("app", "profile", "entitlements"):
+        if key in params:
+            relative_path(params[key])
+    if not params["app"].endswith(".app"):
+        raise ValueError("mas-pkg app must be an .app directory")
+    if "team_id" in params and (not isinstance(params["team_id"], str) or not re.fullmatch(r"[A-Z0-9]{10}", params["team_id"])):
+        raise ValueError("invalid MAS team_id")
+    if "hardened_runtime" in params and type(params["hardened_runtime"]) is not bool:
+        raise ValueError("hardened_runtime must be boolean")
+    if "entitlements" in params and "entitlement_values" in params:
+        raise ValueError("choose entitlements or entitlement_values")
+    if "entitlement_values" in params:
+        validate_mas_entitlements(params["entitlement_values"])
+        if set(params["entitlement_values"]) & MAS_ID_ENTITLEMENTS:
+            raise ValueError("MAS identity entitlements are generated from the profile")
+
+
+def mas_identity(ctx, team, installer=False):
+    """Resolve privately; productbuild requires the certificate Common Name."""
+    types = ("3rd Party Mac Developer Installer", "Mac Installer Distribution") if installer else ("Apple Distribution",)
+    found = set()
+    def inspect(line):
+        match = re.fullmatch(r'\s*\d+\) ([0-9A-Fa-f]{40}) "(.+)"\s*', line)
+        if not match:
+            return
+        fingerprint, subject = match.groups()
+        for authority in types:
+            if subject.startswith(authority + ": ") and subject.endswith(" (" + team + ")"):
+                found.add((fingerprint.upper(), authority, subject))
+    # Installer certificates are excluded by the codesigning policy.
+    code = ctx.run(["security", "find-identity", "-v", "-p", "basic" if installer else "codesigning"],
+                   parse_output=inspect, capture_only=True, log_cmd=False, check=False)
+    if code or len(found) != 1:
+        raise ctx.Fail("MAS needs exactly one valid " + ("Mac Installer Distribution" if installer else "Apple Distribution") + " identity for the configured team")
+    return next(iter(found))
+
+
+def mas_profile(ctx, path, team, bundle, fingerprint):
+    with tempfile.TemporaryDirectory(prefix="mas-profile-", dir=ctx.art) as tmp:
+        decoded = os.path.join(tmp, "profile.plist")
+        code = ctx.run(["security", "cms", "-D", "-i", path, "-o", decoded],
+                       capture_only=True, log_cmd=False, check=False)
+        try:
+            if code:
+                raise ValueError()
+            with open(decoded, "rb") as f:
+                profile = plistlib.load(f)
+            ent = profile["Entitlements"]
+            mas_authorize_entitlements(ctx, {"com.apple.developer.team-identifier": team}, ent)
+            identifier = ent.get("com.apple.application-identifier")
+            prefixes = profile["ApplicationIdentifierPrefix"]
+            if (not isinstance(prefixes, list) or not prefixes or
+                    any(not isinstance(p, str) or not re.fullmatch(r"[A-Z0-9]{10}", p) for p in prefixes)):
+                raise ValueError()
+            if not isinstance(identifier, str):
+                raise ctx.Fail("MAS profile does not authorize entitlement: com.apple.application-identifier")
+            # A wildcard is allowed only as the final component and matches sub-identifiers.
+            matches = any(identifier == prefix + "." + bundle or
+                          (identifier.endswith(".*") and identifier.count("*") == 1 and
+                           (prefix + "." + bundle).startswith(identifier[:-1])) for prefix in prefixes)
+            if not matches:
+                raise ctx.Fail("MAS profile does not authorize entitlement: com.apple.application-identifier")
+            expiry = profile["ExpirationDate"]
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=datetime.timezone.utc)
+            if (profile["Platform"] != ["OSX"] or profile["TeamIdentifier"] != [team] or
+                    ent.get("get-task-allow", False) is not False or ent.get("com.apple.security.get-task-allow", False) is not False or
+                    "ProvisionedDevices" in profile or profile.get("ProvisionsAllDevices", False) is not False or
+                    expiry <= datetime.datetime.now(datetime.timezone.utc) or
+                    fingerprint not in {hashlib.sha1(cert).hexdigest().upper() for cert in profile["DeveloperCertificates"]} or
+                    not isinstance(profile["Name"], str) or not profile["Name"] or
+                    not isinstance(profile["UUID"], str) or not profile["UUID"]):
+                raise ValueError()
+            # Prefix is preserved even for older accounts whose app prefix differs from the team.
+            prefix = next(p for p in prefixes if identifier.startswith(p + "."))
+            return profile, prefix + "." + bundle
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, StopIteration, plistlib.InvalidFileException):
+            raise ctx.Fail("invalid MAS profile: requires unexpired macOS App Store distribution, matching team, bundle and signing certificate") from None
+
+
+def mas_authorize_entitlements(ctx, values, permitted):
+    """Every effective entitlement must be granted by this exact profile."""
+    for key, requested in values.items():
+        allowed = permitted.get(key) if isinstance(permitted, dict) else None
+        authorized = False
+        if isinstance(permitted, dict) and key in permitted:
+            if type(requested) is bool:
+                authorized = type(allowed) is bool and (not requested or allowed)
+            elif isinstance(requested, list):
+                authorized = isinstance(allowed, list) and all(
+                    any(type(item) is type(grant) and item == grant for grant in allowed) for item in requested)
+            elif type(requested) is str and type(allowed) is str and key == "com.apple.application-identifier":
+                authorized = (requested == allowed or
+                              (allowed.endswith(".*") and allowed.count("*") == 1 and requested.startswith(allowed[:-1])))
+            else:
+                authorized = type(requested) is type(allowed) and requested == allowed
+        if not authorized:
+            raise ctx.Fail("MAS profile does not authorize entitlement: " + key)
+
+
+def mas_copy_app(ctx, source, app):
+    """Pin the artifact root and every ancestor; never open an absolute source parent."""
+    deadline = time.monotonic() + DEFAULT_STEP_TIMEOUT
+    if getattr(ctx, "unity_deadline", None) is not None:
+        deadline = min(deadline, ctx.unity_deadline)
+
+    def check():
+        if os.path.exists(getattr(ctx, "cancel_file", "")):
+            raise ctx.Cancelled()
+        if time.monotonic() >= deadline:
+            raise ctx.Fail("MAS job timed out during app copy or validation")
+
+    parent_fd = None
+    try:
+        check()
+        parent_fd = os.open(ctx.inputs, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        contained_path(ctx, ctx.inputs, source)
+        parts = os.path.normpath(source).split(os.sep)
+        for name in parts[:-1]:
+            check()
+            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        copy_collect_entry(ctx, parent_fd, parts[-1], app, ".", check)
+        validate_collect_tree(ctx, app, app, check=check)
+        check()
+    except BaseException as e:
+        remove_collect_copy(app)
+        if isinstance(e, OSError):
+            raise ctx.Fail("MAS app source changed or could not be copied") from None
+        raise
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def mas_code_paths(app):
+    """Find actual Mach-O code plus enclosing code bundles, deepest first; skip aliases."""
+    magics = {b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+              b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
+    code = set()
+    for folder, dirs, files in os.walk(app, followlinks=False):
+        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(folder, name))]
+        for name in files:
+            path = os.path.join(folder, name)
+            if os.path.islink(path):
+                continue
+            with open(path, "rb") as f:
+                if f.read(4) not in magics:
+                    continue
+            code.add(path)
+            parent = os.path.dirname(path)
+            while parent != app:
+                if parent.endswith((".app", ".framework", ".xpc", ".appex", ".bundle")):
+                    code.add(parent)
+                parent = os.path.dirname(parent)
+    return sorted(code, key=lambda p: (-p.count(os.sep), p))
+
+
+def k_mas_pkg(ctx):
+    """Package a source .app for the Mac App Store with local Apple Distribution and Mac Installer
+    Distribution identities. Requires from_job, app and profile (under host mas_profiles_dir).
+    Optional entitlements plist or entitlement_values, team_id (else host team_id), hardened_runtime.
+    Sandbox required; only documented boolean capabilities accepted. No upload or notarization.
+    Checks profile/certificate compatibility and pkgutil signature; writes mas-pkg.json."""
+    need_target(ctx, ("macos",))
+    try:
+        validate_mas_pkg_params(ctx.p)
+    except ValueError as e:
+        raise ctx.Fail(str(e)) from None
+    if not ctx.inputs:
+        raise ctx.Fail("mas-pkg requires from_job artifacts")
+    team = ctx.p.get("team_id") or ctx.cfg.get("team_id")
+    if not isinstance(team, str) or not re.fullmatch(r"[A-Z0-9]{10}", team):
+        raise ctx.Fail("mas-pkg requires team_id in params or host config")
+    profiles = ctx.cfg.get("mas_profiles_dir")
+    if not isinstance(profiles, str) or not os.path.isabs(os.path.expanduser(profiles)):
+        raise ctx.Fail("host config needs an absolute mas_profiles_dir")
+    profile_path = contained_path(ctx, os.path.expanduser(profiles), ctx.p["profile"])
+    source = contained_path(ctx, ctx.inputs, ctx.p["app"])
+    if not os.path.isdir(source) or not os.path.isfile(profile_path):
+        raise ctx.Fail("mas-pkg requires an app directory and regular profile file")
+    app = os.path.join(ctx.art, os.path.basename(source))
+    if os.path.lexists(app) or os.path.lexists(os.path.join(ctx.art, "out.pkg")):
+        raise ctx.Fail("MAS output already exists")
+    mas_copy_app(ctx, ctx.p["app"], app)
+    try:
+        info = app_info(app)
+        bundle, version, build = (info[k] for k in ("CFBundleIdentifier", "CFBundleShortVersionString", "CFBundleVersion"))
+        if (not isinstance(bundle, str) or not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", bundle) or
+                any(not isinstance(v, str) or not v or any(ord(c) < 32 for c in v) for v in (version, build)) or
+                not os.path.isfile(os.path.join(app, "Contents", "Info.plist"))):
+            raise ValueError()
+    except (OSError, ValueError, KeyError, TypeError, plistlib.InvalidFileException):
+        raise ctx.Fail("MAS app requires a macOS Info.plist with bundle id, version and build") from None
+    values = dict(ctx.p.get("entitlement_values", {}))
+    if "entitlements" in ctx.p:
+        path = contained_path(ctx, ctx.inputs, ctx.p["entitlements"])
+        try:
+            with open(path, "rb") as f:
+                values = plistlib.load(f)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            raise ctx.Fail("invalid MAS entitlement plist") from None
+    try:
+        validate_mas_entitlements(values)
+    except ValueError as e:
+        raise ctx.Fail(str(e)) from None
+    app_hash, app_authority, _ = mas_identity(ctx, team)
+    _, installer_authority, installer_name = mas_identity(ctx, team, installer=True)
+    with tempfile.TemporaryDirectory(prefix="mas-pkg-", dir=ctx.art) as tmp:
+        snapshot = os.path.join(tmp, "profile.provisionprofile")
+        with open(profile_path, "rb") as source_profile, open(snapshot, "xb") as private_profile:
+            os.fchmod(private_profile.fileno(), 0o600)
+            shutil.copyfileobj(source_profile, private_profile, 1 << 20)
+        profile, app_identifier = mas_profile(ctx, snapshot, team, bundle, app_hash)
+        managed = {"com.apple.application-identifier": app_identifier, "com.apple.developer.team-identifier": team}
+        for key, value in managed.items():
+            if key in values and values[key] != value:
+                raise ctx.Fail("MAS identity entitlements must match the provisioning profile: " + key)
+        values.update(managed)
+        values["com.apple.security.app-sandbox"] = True
+        mas_authorize_entitlements(ctx, values, profile["Entitlements"])
+        entitlements = os.path.join(ctx.art, "MAS-Entitlements.plist")
+        with open(entitlements, "wb") as f:
+            plistlib.dump(values, f)
+        embedded = os.path.join(app, "Contents", "embedded.provisionprofile")
+        if os.path.lexists(embedded):
+            os.unlink(embedded)
+        shutil.copyfile(snapshot, embedded)
+    flags = ["--options", "runtime"] if ctx.p.get("hardened_runtime") else []
+    for path in mas_code_paths(app) + [app]:
+        ctx.run(["codesign", "--force", "--sign", app_hash] + flags +
+                (["--entitlements", entitlements] if path == app else []) + [path],
+                capture_only=True, log_cmd=False)
+    pkg = os.path.join(ctx.art, "out.pkg")
+    ctx.run(["productbuild", "--component", app, "/Applications", "--sign", installer_name, pkg],
+            capture_only=True, log_cmd=False)
+    ctx.run(["pkgutil", "--check-signature", pkg], capture_only=True, log_cmd=False)
+    digest = hashlib.sha256()
+    with open(pkg, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    ctx.write("mas-pkg.json", json.dumps({"path": "out.pkg", "sha256": digest.hexdigest(), "size": os.path.getsize(pkg),
+              "bundle_id": bundle, "version": version, "build": build, "app_signing_authority_type": app_authority,
+              "installer_authority_type": installer_authority, "team": team, "profile_name": profile["Name"],
+              "profile_uuid": profile["UUID"], "entitlement_keys": sorted(values)}, indent=2))
 
 
 KINDS = {name[2:].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("k_")}

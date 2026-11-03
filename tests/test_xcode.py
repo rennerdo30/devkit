@@ -21,6 +21,7 @@ class XcodeTests(unittest.TestCase):
         self.ctx.art = str(self.root / "art")
         self.ctx.derived = str(self.root / "derived")
         self.ctx.inputs = None
+        self.ctx.cfg = {}
         for folder in (self.ctx.work, self.ctx.art, self.ctx.derived):
             Path(folder).mkdir()
         Path(self.ctx.work, "Game.xcodeproj").mkdir()
