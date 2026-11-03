@@ -329,6 +329,16 @@ class CollectRunnerTests(unittest.TestCase):
 
 
 class AabSignTests(unittest.TestCase):
+    UPLOAD_VERIFY_OUTPUT = """jar verified, with signer errors.
+Error:
+This jar contains entries whose certificate chain is invalid. Reason: PKIX path building failed: sun.security.provider.certpath.SunCertPathBuilderException: unable to find valid certification path to requested target
+This jar contains entries whose signer certificate is self-signed.
+Warning:
+This jar contains signatures that do not include a timestamp. Without a timestamp, users may not be able to validate this jar after any of the signer certificates expire (as early as 2054-03-21).
+POSIX file permission and/or symlink attributes detected. These attributes are ignored when signing and are not protected by the signature.
+Re-run with the -verbose and -certs options for more details.
+"""
+
     @classmethod
     def setUpClass(cls):
         cls.runner = load_runner()
@@ -469,6 +479,61 @@ class AabSignTests(unittest.TestCase):
                  ('jar verified.\nWarning: unsigned entries in base/assets/data', 0),
                  ('jar verified.\nSignature algorithm is disabled', 0),
                  ('jar verified.\nThe signer key is weak', 0)]
+        for output, code in cases:
+            with self.subTest(output=output, code=code):
+                (self.art / 'game.aab').unlink(missing_ok=True)
+                self.tool('jarsigner', "if '-verify' in sys.argv:\n print(" + repr(output) + "); sys.exit(" + str(code) + ")")
+                with self.assertRaises(self.runner.Fail):
+                    self.kinds.k_aab_sign(self.ctx)
+                self.assertFalse((self.art / 'aab-sign.json').exists())
+
+    def test_verify_accepts_expected_upload_certificate_diagnostics(self):
+        for output, code in ((self.UPLOAD_VERIFY_OUTPUT, 4), (self.UPLOAD_VERIFY_OUTPUT.upper(), 4),
+                             (self.UPLOAD_VERIFY_OUTPUT, 0)):
+            with self.subTest(output=output, code=code):
+                (self.art / 'game.aab').unlink(missing_ok=True)
+                (self.art / 'aab-sign.json').unlink(missing_ok=True)
+                self.tool('jarsigner', "if '-verify' in sys.argv:\n print(" + repr(output) + "); sys.exit(" + str(code) + ")")
+                self.kinds.k_aab_sign(self.ctx)
+                self.assertTrue((self.art / 'aab-sign.json').exists())
+
+    def test_verify_rejects_unexpected_diagnostics_alongside_expected_ones(self):
+        diagnostics = (
+            'Warning: This jar contains unsigned entries.',
+            'unsigned entries',
+            'This entry is not signed.',
+            'Warning: Signature uses a disabled algorithm.',
+            'Signature algorithm is considered a security risk.',
+            'The signer key is weak.',
+            'Error: This jar contains entries whose signer certificate has expired.',
+            'This jar contains entries whose signer certificate is not yet valid.',
+            'Error: An unknown verification error occurred.',
+            'Warning: An unknown verification warning occurred.',
+        )
+        for diagnostic in diagnostics:
+            for code in (0, 4):
+                with self.subTest(diagnostic=diagnostic, code=code):
+                    (self.art / 'game.aab').unlink(missing_ok=True)
+                    output = self.UPLOAD_VERIFY_OUTPUT + diagnostic
+                    self.tool('jarsigner', "if '-verify' in sys.argv:\n print(" + repr(output) + "); sys.exit(" + str(code) + ")")
+                    with self.assertRaises(self.runner.Fail):
+                        self.kinds.k_aab_sign(self.ctx)
+                    self.assertFalse((self.art / 'aab-sign.json').exists())
+                    argv = [json.loads(line) for line in self.journal.read_text().splitlines()]
+                    self.assertFalse(any('-printcert' in a for a in argv))
+
+    def test_verify_rejects_invalid_exit_marker_and_unaccompanied_chain_error(self):
+        cases = [(self.UPLOAD_VERIFY_OUTPUT, code) for code in (1, 8, 16)]
+        cases += [(self.UPLOAD_VERIFY_OUTPUT.replace('jar verified, with signer errors.', ''), 4),
+                  ('Re-run with the -verbose and -certs options for more details.', 0),
+                  ('jar verified.\nRe-run with the -verbose and -certs options for more details.', 4),
+                  (self.UPLOAD_VERIFY_OUTPUT + 'Re-run with the -verbose and -certs options for more details. unsigned entries', 0),
+                  ('jar verified.\nWarning:\nRe-run with the -verbose and -certs options for more details.', 0),
+                  (self.UPLOAD_VERIFY_OUTPUT.replace(
+                      'This jar contains entries whose signer certificate is self-signed.\n', ''), 4),
+                  (self.UPLOAD_VERIFY_OUTPUT.replace('self-signed.', 'self-signed. unsigned entries'), 4),
+                  ('jar verified.\nWarning:', 0),
+                  ('not jar verified.', 0)]
         for output, code in cases:
             with self.subTest(output=output, code=code):
                 (self.art / 'game.aab').unlink(missing_ok=True)
