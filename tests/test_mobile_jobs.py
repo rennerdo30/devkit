@@ -9,7 +9,6 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
-import time
 import unittest
 from unittest import mock
 import zipfile
@@ -37,31 +36,6 @@ class UnityProjectTests(unittest.TestCase):
         patch = mock.patch.object(kinds, 'UNITY_EDITORS', str(self.base / 'editors'))
         patch.start()
         self.addCleanup(patch.stop)
-        self.editor_run = self.ctx.run
-        self.copy_codes = [1, 0]
-        self.before_copy = None
-        self.ctx.run = self.fake_run
-
-    def fake_run(self, cmd, **kwargs):
-        if cmd[0] != '/bin/cp':
-            return self.editor_run(cmd, **kwargs)
-        self.ctx.calls.append((cmd, kwargs))
-        if self.before_copy:
-            self.before_copy()
-            self.before_copy = None
-        code = self.copy_codes.pop(0) if self.copy_codes else 0
-        if code:
-            if kwargs.get('check', True):
-                raise self.ctx.Fail('copy failed')
-            return code
-        source, dest = cmd[-2:]
-        if os.path.islink(source):
-            os.symlink(os.readlink(source), dest)
-        elif os.path.isdir(source):
-            shutil.copytree(source, dest, symlinks=True)
-        else:
-            shutil.copy2(source, dest, follow_symlinks=False)
-        return 0
 
     def nested_project(self):
         project = Path(self.ctx.work, 'unity')
@@ -172,44 +146,61 @@ class UnityProjectTests(unittest.TestCase):
         with self.assertRaisesRegex(self.ctx.Fail, 'not a passing'):
             kinds.k_unity(self.ctx)
 
-    def test_clone_success_does_not_fallback(self):
-        Path(self.ctx.work, 'out.txt').write_text('data')
+    def test_collect_file_uses_fd_and_preserves_mode(self):
+        source = Path(self.ctx.work, 'out.txt')
+        source.write_text('data')
+        source.chmod(0o751)
         self.ctx.p['collect'] = ['out.txt']
-        self.copy_codes = [0]
         kinds.k_unity(self.ctx)
         copies = [cmd for cmd, _ in self.ctx.calls if cmd[0] == '/bin/cp']
-        self.assertEqual(len(copies), 1)
-        self.assertEqual(copies[0][:4], ['/bin/cp', '-c', '-R', '-P'])
+        self.assertEqual(copies, [])
         self.assertEqual(Path(self.ctx.art, 'out.txt').read_text(), 'data')
+        self.assertEqual(Path(self.ctx.art, 'out.txt').stat().st_mode & 0o7777, 0o751)
 
-    def test_collect_source_swap_preserves_links_then_rejects_copied_escape(self):
+    def test_collect_source_file_swap_never_follows_link(self):
         output = Path(self.ctx.work, 'out')
         output.mkdir()
         source = output / 'payload'
+        source.write_text('safe-content')
         host_file = self.base / 'host-file'
         host_file.write_text('private-host-content')
         self.ctx.p['collect'] = ['out']
-        validate = kinds.validate_collect_tree
-        for codes in ([0], [1, 0]):
-            with self.subTest(codes=codes):
-                source.unlink(missing_ok=True)
-                source.write_text('safe-content')
-                self.copy_codes = list(codes)
-                def swap():
-                    source.unlink()
-                    source.symlink_to(host_file)
-                self.before_copy = swap
-                def inspect(ctx, root, path, active=None):
-                    self.assertEqual(root, str(Path(ctx.art, 'out')))
-                    if active is None:
-                        self.assertTrue(Path(path, 'payload').is_symlink())
-                    return validate(ctx, root, path, active)
-                with mock.patch.object(kinds, 'validate_collect_tree', side_effect=inspect), self.assertRaisesRegex(self.ctx.Fail, 'symlink escape'):
-                    kinds.k_unity(self.ctx)
-                self.assertFalse(Path(self.ctx.art, 'out').exists())
-                self.assertEqual(host_file.read_text(), 'private-host-content')
-        copies = [cmd for cmd, _ in self.ctx.calls if cmd[0] == '/bin/cp']
-        self.assertTrue(all('-P' in cmd and '-L' not in cmd for cmd in copies))
+        real_open = os.open
+        def swap(name, flags, *args, **kwargs):
+            if name == 'payload':
+                source.unlink()
+                source.symlink_to(host_file)
+                self.assertTrue(flags & os.O_NOFOLLOW)
+                self.assertIn('dir_fd', kwargs)
+            return real_open(name, flags, *args, **kwargs)
+        with mock.patch.object(kinds.os, 'open', side_effect=swap), \
+                self.assertRaisesRegex(self.ctx.Fail, 'source changed'):
+            kinds.k_unity(self.ctx)
+        self.assertFalse(Path(self.ctx.art, 'out').exists())
+        self.assertEqual(host_file.read_text(), 'private-host-content')
+
+    def test_collect_intermediate_directory_swap_after_validation_fails_closed(self):
+        output = Path(self.ctx.work, 'out')
+        (output / 'build').mkdir(parents=True)
+        (output / 'build/safe').write_text('safe-content')
+        outside = self.base / 'outside'
+        (outside / 'build').mkdir(parents=True)
+        (outside / 'build/payload').write_text('private-host-content')
+        self.ctx.p['collect'] = ['out/build']
+        validate = kinds.contained_path
+        def swap(ctx, base, rel, allow_root=False):
+            result = validate(ctx, base, rel, allow_root)
+            if rel == 'out/build':
+                output.rename(Path(ctx.work, 'original-out'))
+                output.symlink_to(outside, target_is_directory=True)
+            return result
+        with mock.patch.object(kinds, 'contained_path', side_effect=swap), \
+                mock.patch.object(kinds.os, 'read', wraps=os.read) as read, \
+                self.assertRaisesRegex(self.ctx.Fail, 'source changed'):
+            kinds.collect_unity(self.ctx)
+        read.assert_not_called()
+        self.assertEqual(list(Path(self.ctx.art).iterdir()), [])
+        self.assertEqual((outside / 'build/payload').read_text(), 'private-host-content')
 
     def test_collect_keeps_relative_internal_link_and_rejects_link_to_sibling(self):
         output = Path(self.ctx.work, 'out')
@@ -257,15 +248,14 @@ class UnityProjectTests(unittest.TestCase):
             kinds.collect_unity(self.ctx)
         self.assertFalse(os.path.lexists(Path(self.ctx.art, 'export')))
 
-    def test_collect_clone_and_fallback_share_remaining_deadline(self):
+    def test_collect_enforces_expired_deadline_before_copy(self):
         Path(self.ctx.work, 'out').write_text('data')
         self.ctx.p['collect'] = ['out']
         self.ctx.unity_deadline = 100
-        with mock.patch.object(kinds.time, 'monotonic', side_effect=[40, 70]):
+        with mock.patch.object(kinds.time, 'monotonic', return_value=101), \
+                self.assertRaisesRegex(self.ctx.Fail, 'timed out'):
             kinds.collect_unity(self.ctx)
-        copies = [(cmd, options) for cmd, options in self.ctx.calls if cmd[0] == '/bin/cp']
-        self.assertEqual([options['timeout'] for _, options in copies], [60, 30])
-        self.assertEqual(copies[1][0][:3], ['/bin/cp', '-R', '-P'])
+        self.assertEqual(list(Path(self.ctx.art).iterdir()), [])
 
     def test_host_env_allowlist_only_and_secret_values_marked(self):
         self.ctx.cfg = {'unity_env': {'UNITY_TOOLS_PYTHON': '/path/to/venv/bin/python', 'UNITY_API_TOKEN': 'fixture-secret',
@@ -296,43 +286,46 @@ class CollectRunnerTests(unittest.TestCase):
     def setUpClass(cls):
         cls.runner = load_runner()
 
-    def test_cancel_and_deadline_stop_clone_and_fallback_and_remove_partial_copy(self):
+    def test_cancel_and_deadline_stop_fd_copy_and_remove_partial_copy(self):
         for cancel in (False, True):
-            for fallback in (False, True):
-                with self.subTest(cancel=cancel, fallback=fallback), tempfile.TemporaryDirectory() as directory:
+            for during_file in (False, True):
+                with self.subTest(cancel=cancel, during_file=during_file), tempfile.TemporaryDirectory() as directory:
                     base = Path(directory)
                     work, art = base / 'checkout', base / 'artifacts'
                     work.mkdir()
                     art.mkdir()
                     (work / 'out').mkdir()
+                    (work / 'out/data').write_bytes(b'x' * (2 * 1024 * 1024))
                     cancel_file = base / 'cancel'
-                    fake_cp = base / 'fake-cp'
-                    fake_cp.write_text('#!' + sys.executable + '\n' +
-                        'import pathlib,sys,time\n' +
-                        'dest=pathlib.Path(sys.argv[-1]); dest.mkdir(); (dest / "partial").write_text("data")\n' +
-                        ('if "-c" in sys.argv: sys.exit(1)\n' if fallback else '') +
-                        ('pathlib.Path(' + repr(str(cancel_file)) + ').touch()\n' if cancel else '') +
-                        'time.sleep(30)\n')
-                    fake_cp.chmod(0o755)
-                    popen = self.runner.subprocess.Popen
-                    def launch(cmd, **kwargs):
-                        if cmd[0] == '/bin/cp':
-                            cmd = [str(fake_cp)] + cmd[1:]
-                        return popen(cmd, **kwargs)
+                    clock = [40]
+                    read = os.read
+                    reads = []
+                    def stop_copy(fd, size):
+                        chunk = read(fd, size)
+                        reads.append(len(chunk))
+                        if len(reads) == 2:
+                            self.assertEqual((art / 'out/data').stat().st_size, 1024 * 1024)
+                            if cancel:
+                                cancel_file.touch()
+                            else:
+                                clock[0] = 101
+                        return chunk
                     with mock.patch.object(self.runner, 'config', return_value={}), mock.patch.object(self.runner, 'save'), \
-                            mock.patch.object(self.runner.subprocess, 'Popen', side_effect=launch):
+                            mock.patch.object(self.runner.devkit_kinds.os, 'read', side_effect=stop_copy), \
+                            mock.patch.object(self.runner.devkit_kinds.time, 'monotonic', side_effect=lambda: clock[0]):
                         ctx = self.runner.Ctx({'id': 'fixture', 'project': 'fixture', 'params': {'collect': ['out']}}, io.StringIO(), str(art))
                         ctx.work = str(work)
                         ctx.cancel_file = str(cancel_file)
-                        ctx.unity_deadline = time.monotonic() + (10 if cancel else 0.4)
-                        start = time.monotonic()
+                        ctx.unity_deadline = 100
+                        if not during_file:
+                            if cancel:
+                                cancel_file.touch()
+                            else:
+                                clock[0] = 101
                         with self.assertRaises(self.runner.Cancelled if cancel else self.runner.Fail):
                             self.runner.devkit_kinds.collect_unity(ctx)
-                        self.assertLess(time.monotonic() - start, 4)
                     self.assertFalse((art / 'out').exists())
-                    self.assertIsNone(ctx.st['pid'])
-                    self.assertIsNone(ctx.st['process_group'])
-                    self.assertEqual(len(ctx.st['steps']), 2 if fallback else 1)
+                    self.assertEqual(len(reads), 2 if during_file else 0)
 
 
 class AabSignTests(unittest.TestCase):

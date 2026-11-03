@@ -13,7 +13,7 @@ aab-sign params: from_job, aab (relative artifact path), keystore_path (host fil
   alias, keychain_service, keychain_account. Passwords are read from Keychain only at execution time.
 Targets (job "target"): ios (device), ios-sim, macos; android for aab-sign.
 """
-import glob, hashlib, json, math, os, plistlib, re, shutil, subprocess, time, zipfile
+import glob, hashlib, json, math, os, plistlib, re, shutil, stat, subprocess, time, zipfile
 import xml.etree.ElementTree as ET
 
 XCODE_TARGETS = ("ios", "ios-sim", "macos")
@@ -70,8 +70,10 @@ def contained_path(ctx, base, rel, allow_root=False):
     return path
 
 
-def validate_collect_tree(ctx, root, path, active=None):
+def validate_collect_tree(ctx, root, path, active=None, check=None):
     """Validate the copied tree, retaining only relative links inside this copy."""
+    if check is not None:
+        check()
     active = set() if active is None else active
     if os.path.islink(path) and os.path.isabs(os.readlink(path)):
         raise ctx.Fail("collect contains an absolute symlink escape")
@@ -84,7 +86,7 @@ def validate_collect_tree(ctx, root, path, active=None):
         if real in active:
             raise ctx.Fail("collect contains a symlink cycle")
         for name in os.listdir(real):
-            validate_collect_tree(ctx, root, os.path.join(real, name), active | {real})
+            validate_collect_tree(ctx, root, os.path.join(real, name), active | {real}, check)
     elif not os.path.isfile(real):
         raise ctx.Fail("collect requires existing regular files or directories")
 
@@ -98,28 +100,95 @@ def remove_collect_copy(path):
         os.unlink(path)
 
 
+def copy_collect_entry(ctx, parent_fd, name, dest, relative, check):
+    """Read only pinned descriptors; source links are data, never traversal paths."""
+    check()
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISLNK(info.st_mode):
+        target = os.readlink(name, dir_fd=parent_fd)
+        if os.path.isabs(target):
+            raise ctx.Fail("collect contains an absolute symlink escape")
+        resolved = os.path.normpath(os.path.join(os.path.dirname(relative), target))
+        if relative == "." or resolved == ".." or resolved.startswith("../"):
+            raise ctx.Fail("collect contains a symlink escape")
+        os.symlink(target, dest)
+        return
+    # O_NONBLOCK prevents a regular-file-to-FIFO swap from blocking before fstat.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if stat.S_ISDIR(info.st_mode):
+        flags |= os.O_DIRECTORY
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            os.mkdir(dest)
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    copy_collect_entry(ctx, fd, entry.name, os.path.join(dest, entry.name),
+                                       os.path.join(relative, entry.name), check)
+            os.chmod(dest, stat.S_IMODE(info.st_mode))
+        elif stat.S_ISREG(info.st_mode):
+            with open(dest, "xb") as output:
+                while True:
+                    check()
+                    chunk = os.read(fd, 1024 * 1024)
+                    check()
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                output.flush()
+                os.fchmod(output.fileno(), stat.S_IMODE(info.st_mode))
+        else:
+            raise ctx.Fail("collect requires existing regular files or directories")
+        check()
+    finally:
+        os.close(fd)
+
+
 def collect_unity(ctx):
-    for rel in ctx.p.get("collect", []):
-        contained_path(ctx, ctx.work, rel)
-        source = os.path.join(ctx.work, os.path.normpath(rel))
-        dest = os.path.join(ctx.art, os.path.basename(os.path.normpath(rel)))
-        if os.path.basename(dest).casefold() in RESERVED_ARTIFACT_NAMES:
-            raise ctx.Fail("collect artifact name is reserved: " + os.path.basename(dest))
-        if any(name.casefold() == os.path.basename(dest).casefold() for name in os.listdir(ctx.art)):
-            raise ctx.Fail("collect artifact name already exists: " + os.path.basename(dest))
-        def remaining():
-            deadline = getattr(ctx, "unity_deadline", None)
-            return unity_timeout(ctx.p) if deadline is None else max(0, deadline - time.monotonic())
-        try:
-            # Preserve links on both paths; inspect the result after any source swaps.
-            # Both copies use the runner's cancellation and remaining job deadline.
-            if ctx.run(["/bin/cp", "-c", "-R", "-P", source, dest], check=False, timeout=remaining()):
+    paths = ctx.p.get("collect", [])
+    if not paths:
+        return
+    deadline = getattr(ctx, "unity_deadline", None)
+    if deadline is None:
+        deadline = time.monotonic() + unity_timeout(ctx.p)
+    def check():
+        if os.path.exists(getattr(ctx, "cancel_file", "")):
+            raise ctx.Cancelled()
+        if time.monotonic() >= deadline:
+            raise ctx.Fail("Unity job timed out during collect")
+    work_fd = os.open(ctx.work, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for rel in paths:
+            check()
+            contained_path(ctx, ctx.work, rel)
+            parts = os.path.normpath(rel).split(os.sep)
+            dest = os.path.join(ctx.art, parts[-1])
+            if parts[-1].casefold() in RESERVED_ARTIFACT_NAMES:
+                raise ctx.Fail("collect artifact name is reserved: " + parts[-1])
+            if any(name.casefold() == parts[-1].casefold() for name in os.listdir(ctx.art)):
+                raise ctx.Fail("collect artifact name already exists: " + parts[-1])
+            parent_fd = os.dup(work_fd)
+            try:
+                for name in parts[:-1]:
+                    check()
+                    child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                    os.close(parent_fd)
+                    parent_fd = child_fd
+                copy_collect_entry(ctx, parent_fd, parts[-1], dest, ".", check)
+                # Resolve only the private copy to reject dangling links and cycles,
+                # including escapes through chains of otherwise relative links.
+                validate_collect_tree(ctx, dest, dest, check=check)
+                check()
+            except BaseException as e:
                 remove_collect_copy(dest)
-                ctx.run(["/bin/cp", "-R", "-P", source, dest], timeout=remaining())
-            validate_collect_tree(ctx, dest, dest)
-        except BaseException:
-            remove_collect_copy(dest)
-            raise
+                if isinstance(e, OSError):
+                    raise ctx.Fail("collect source changed or could not be copied") from None
+                raise
+            finally:
+                os.close(parent_fd)
+    finally:
+        os.close(work_fd)
 
 
 def unity_env(ctx):

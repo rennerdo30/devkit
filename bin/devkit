@@ -157,6 +157,7 @@ class ProcessChildren:
 # ---------------------------------------------------------------- job context handed to kinds
 class Ctx:
     Fail = Fail
+    Cancelled = Cancelled
 
     def __init__(self, st, logf, art):
         self.st, self.logf, self.art = st, logf, art
