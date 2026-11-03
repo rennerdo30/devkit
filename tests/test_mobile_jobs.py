@@ -155,11 +155,12 @@ class UnityProjectTests(unittest.TestCase):
         copy.assert_not_called()
 
     def test_host_env_allowlist_only_and_secret_values_marked(self):
-        self.ctx.cfg = {'unity_env': {'UNITY_TOOLS_PYTHON': '/path/to/venv/bin/python', 'UNITY_API_TOKEN': 'fixture-secret'}}
+        self.ctx.cfg = {'unity_env': {'UNITY_TOOLS_PYTHON': '/path/to/venv/bin/python', 'UNITY_API_TOKEN': 'fixture-secret',
+                                      'UNITY_PASSPHRASE': 'fixture-passphrase'}}
         kinds.k_unity(self.ctx)
         options = self.ctx.calls[0][1]
         self.assertEqual(options['env'], self.ctx.cfg['unity_env'])
-        self.assertEqual(options['redact_values'], ['fixture-secret'])
+        self.assertEqual(options['redact_values'], ['fixture-secret', 'fixture-passphrase'])
         with self.assertRaises(ValueError):
             kinds.validate_unity_params({'method': 'Build.Export', 'env': {'PATH': 'bad'}})
         for env in ([], {'BAD-NAME': 'value'}, {'UNITY_TEST': 3}, {'UNITY_TEST': 'a\nb'}):

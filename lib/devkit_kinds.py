@@ -41,7 +41,7 @@ UNITY_PARAMS = {
 UNITY_EXTRA_SWITCHES = {"-accept-apiupdate", "-force-metal", "-force-glcore"}
 UNITY_TEST_SWITCHES = {"-runSynchronously"}
 UNITY_TEST_VALUES = {"-testFilter", "-testCategory", "-assemblyNames"}
-SECRET_KEY = re.compile(r"password|passwd|secret|token|credential|username|serial|license|key|auth|bearer", re.I)
+SECRET_KEY = re.compile(r"pass|secret|token|credential|username|serial|license|key|auth|bearer", re.I)
 UNITY_MANAGED = {x.lower() for x in ("-projectPath", "-logFile", "-batchmode", "-quit", "-executeMethod", "-buildTarget", "-nographics", "-runTests", "-testPlatform", "-testResults", "-username", "-password", "-serial")}
 
 
