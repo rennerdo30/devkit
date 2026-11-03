@@ -751,6 +751,49 @@ def aab_manifest(ctx, aab):
         return {"manifest_note": "Package/version metadata skipped: bundletool manifest unavailable or invalid."}
 
 
+def verify_aab_signature(ctx, signer, aab, password):
+    """Allow only the expected Android upload certificate diagnostics, failing closed."""
+    allowed = {
+        "self_signed": r"This jar contains entries whose signer certificate is self-signed\.",
+        "chain": (r"This jar contains entries whose certificate chain is invalid\. Reason: "
+                  r"PKIX path building failed: sun\.security\.provider\.certpath\.SunCertPathBuilderException: "
+                  r"unable to find valid certification path to requested target"),
+        "timestamp": (r"This jar contains signatures that do not include a timestamp\. Without a timestamp, "
+                      r"users may not be able to validate this jar after any of the signer certificates expire "
+                      r"\(as early as \d{4}-\d{2}-\d{2}\)\."),
+        "attributes": (r"POSIX file permission and/or symlink attributes detected\. These attributes are ignored "
+                       r"when signing and are not protected by the signature\."),
+    }
+    seen = set()
+    state = {"verified": False, "rejected": False, "pending": False}
+
+    def inspect(line):
+        line = line.strip()
+        if not line:
+            return
+        if re.fullmatch(r"jar verified(?:\.|, with signer errors\.)", line, re.I):
+            state["verified"] = True
+            return
+        if re.fullmatch(r"(?:Error|Warning):", line, re.I):
+            state["rejected"] |= state["pending"]
+            state["pending"] = True
+            return
+        # Some tools prefix a diagnostic instead of putting its heading on a separate line.
+        line = re.sub(r"^(?:Error|Warning):\s*", "", line, flags=re.I)
+        for kind, pattern in allowed.items():
+            if re.fullmatch(pattern, line, re.I):
+                seen.add(kind)
+                state["pending"] = False
+                return
+        state["rejected"] = True
+
+    code = ctx.run([signer, "-J-Duser.language=en", "-J-Duser.country=US", "-verify", "-strict", "-certs", aab],
+                   parse_output=inspect, redact_values=[password], check=False)
+    if (code not in (0, 4) or not state["verified"] or state["rejected"] or state["pending"] or
+            ("chain" in seen and "self_signed" not in seen) or (code == 4 and not seen)):
+        raise ctx.Fail("AAB signature verification failed (exit %s) or reported disallowed diagnostics" % code)
+
+
 def k_aab_sign(ctx):
     """Sign an Android AAB without Xcode. Required params: from_job, aab (relative artifact path),
     keystore_path (host regular file outside checkout), alias, keychain_service, keychain_account.
@@ -786,14 +829,7 @@ def k_aab_sign(ctx):
         ctx.run([signer, "-keystore", keystore, "-sigalg", "SHA256withRSA", "-digestalg", "SHA-256",
                  "-storepass:env", "DEVKIT_AAB_PASSWORD", "-keypass:env", "DEVKIT_AAB_PASSWORD", aab, ctx.p["alias"]],
                 env={"DEVKIT_AAB_PASSWORD": password}, redact_values=[password])
-        verification = {"verified": False, "warning": False}
-        def inspect_verification(line):
-            verification["verified"] |= "jar verified." in line.lower()
-            verification["warning"] |= bool(re.search(r"\b(warning|unsigned|disabled|weak)\b", line, re.I))
-        ctx.run([signer, "-J-Duser.language=en", "-J-Duser.country=US", "-verify", "-strict", "-certs", aab],
-                parse_output=inspect_verification, redact_values=[password])
-        if not verification["verified"] or verification["warning"]:
-            raise ctx.Fail("AAB signature verification failed or reported warnings")
+        verify_aab_signature(ctx, signer, aab, password)
         fingerprints, public_keys = [], []
         def inspect_certificate(line):
             fingerprints.extend(re.findall(r"SHA256:\s*((?:[0-9a-fA-F]{2}:){31}[0-9a-fA-F]{2})", line))
