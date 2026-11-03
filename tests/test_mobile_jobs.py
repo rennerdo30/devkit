@@ -329,14 +329,20 @@ class CollectRunnerTests(unittest.TestCase):
 
 
 class AabSignTests(unittest.TestCase):
-    AAPT2_OUTPUT = '''N: android=http://schemas.android.com/apk/res/android (line=1)
+    AAPT2_OUTPUT = '''N: android=http://schemas.android.com/apk/res/android
   E: manifest (line=1)
-    A: package="org.example.game" (Raw: "org.example.game")
-    A: android:versionCode(0x0101021b)=12
-    A: android:versionName(0x0101021c)="1.0.0"
-    E: uses-sdk (line=2)
-      A: android:minSdkVersion(0x0101020c)=26
-      A: android:targetSdkVersion(0x01010270)=36
+    A: package="com.example.game" (Raw: "com.example.game")
+    A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=1 (Raw: "1")
+    A: http://schemas.android.com/apk/res/android:versionName(0x0101021c)="1.0.0" (Raw: "1.0.0")
+    A: http://schemas.android.com/apk/res/android:compileSdkVersion(0x01010572)=36 (Raw: "36")
+    A: http://schemas.android.com/apk/res/android:compileSdkVersionCodename(0x01010573)="16" (Raw: "16")
+      E: uses-sdk (line=5)
+        A: http://schemas.android.com/apk/res/android:minSdkVersion(0x0101020c)=26 (Raw: "26")
+        A: http://schemas.android.com/apk/res/android:targetSdkVersion(0x01010270)=36 (Raw: "36")
+      E: application (line=9)
+        A: android:label(0x01010001)="Example Game" (Raw: "Example Game")
+        E: activity (line=11)
+          A: android:name(0x01010003)=".MainActivity" (Raw: ".MainActivity")
 '''
     UPLOAD_VERIFY_OUTPUT = """jar verified, with signer errors.
 Error:
@@ -458,7 +464,7 @@ Re-run with the -verbose and -certs options for more details.
         self.kinds.k_aab_sign(self.ctx)
         report = json.loads((self.art / 'aab-sign.json').read_text())
         self.assertEqual({k: report[k] for k in ('package', 'versionCode', 'versionName', 'minSdk', 'targetSdk', 'manifest_source')},
-                         dict(package='org.example.game', versionCode=12, versionName='1.0.0', minSdk=26, targetSdk=36, manifest_source='aapt2'))
+                         dict(package='com.example.game', versionCode=1, versionName='1.0.0', minSdk=26, targetSdk=36, manifest_source='aapt2'))
         for key in ('versionCode', 'minSdk', 'targetSdk'):
             self.assertIs(type(report[key]), int)
         self.assertNotIn('manifest_note', report)
@@ -467,6 +473,47 @@ Re-run with the -verbose and -certs options for more details.
         verify = next(i for i, a in enumerate(argv) if '-verify' in a)
         self.assertGreater(dump, verify)
         self.assertFalse(Path(argv[dump][3]).exists())
+
+    def test_aapt2_prefixed_attributes_and_hex_integers(self):
+        output = self.AAPT2_OUTPUT.replace('http://schemas.android.com/apk/res/android:', 'android:')
+        output = output.replace('=1 (Raw: "1")', '=0x0000000c')
+        output = output.replace('=26 (Raw: "26")', '=0x0000001a')
+        output = output.replace('=36 (Raw: "36")', '=0x00000024')
+        self.fake_aapt2(output)
+        self.kinds.k_aab_sign(self.ctx)
+        report = json.loads((self.art / 'aab-sign.json').read_text())
+        for key, expected in (('versionCode', 12), ('minSdk', 26), ('targetSdk', 36)):
+            self.assertEqual(report[key], expected)
+            self.assertIs(type(report[key]), int)
+        self.assertEqual(report['versionName'], '1.0.0')
+        self.assertNotIn('manifest_note', report)
+
+    def test_aapt2_attributes_on_other_elements_are_ignored(self):
+        output = self.AAPT2_OUTPUT + '''          A: package="wrong.package"
+          A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=99
+          A: android:versionName(0x0101021c)="wrong version"
+          A: android:minSdkVersion(0x0101020c)=99
+          A: http://schemas.android.com/apk/res/android:targetSdkVersion(0x01010270)=99
+'''
+        self.fake_aapt2(output)
+        self.kinds.k_aab_sign(self.ctx)
+        report = json.loads((self.art / 'aab-sign.json').read_text())
+        self.assertEqual([report[k] for k in ('package', 'versionCode', 'versionName', 'minSdk', 'targetSdk')],
+                         ['com.example.game', 1, '1.0.0', 26, 36])
+        self.assertNotIn('manifest_note', report)
+
+    def test_aapt2_undecodable_integers_are_null_with_note(self):
+        for value in ('@0x7f010001', '(type 0x10)0x0000000c', '0xnope', '12junk', '-1', '0'):
+            with self.subTest(value=value):
+                output = self.AAPT2_OUTPUT.replace('=1 (Raw: "1")', '=' + value + ' (Raw: "12")')
+                output = output.replace('=26 (Raw: "26")', '=' + value + ' (Raw: "26")')
+                output = output.replace('=36 (Raw: "36")', '=' + value + ' (Raw: "36")')
+                self.fake_aapt2(output)
+                report = self.kinds.aapt2_manifest(self.ctx, str(self.source), str(self.bin / 'aapt2'))
+                for key in ('versionCode', 'minSdk', 'targetSdk'):
+                    self.assertIsNone(report[key])
+                    self.assertIn(key, report['manifest_note'])
+                self.assertEqual(report['versionName'], '1.0.0')
 
     def test_aapt2_malformed_manifest_keeps_nulls_and_note(self):
         self.fake_aapt2('E: manifest\n  A: package=invalid\n  A: android:versionCode(0x0101021b)=oops\n'
@@ -500,11 +547,11 @@ Re-run with the -verbose and -certs options for more details.
         self.assertIsNone(report['package'])
         self.assertIn('skipped', report['manifest_note'])
 
-    def test_aapt2_invalid_sdk_is_omitted_with_note(self):
+    def test_aapt2_invalid_sdk_is_null_with_note(self):
         self.fake_aapt2(self.AAPT2_OUTPUT.replace('=26', '="unterminated'))
         self.kinds.k_aab_sign(self.ctx)
         report = json.loads((self.art / 'aab-sign.json').read_text())
-        self.assertNotIn('minSdk', report)
+        self.assertIsNone(report['minSdk'])
         self.assertEqual(report['targetSdk'], 36)
         self.assertIn('minSdk', report['manifest_note'])
 

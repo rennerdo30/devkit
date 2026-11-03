@@ -753,9 +753,12 @@ def manifest_metadata(values, source):
     for key in ("package", "versionCode", "versionName", "minSdk", "targetSdk"):
         value = values.get(key)
         if key in ("versionCode", "minSdk", "targetSdk"):
-            if isinstance(value, str) and re.fullmatch(r"[0-9]+", value) and int(value) > 0:
-                metadata[key] = int(value)
+            if isinstance(value, str) and re.fullmatch(r"(?:[0-9]+|0x[0-9a-fA-F]+)", value):
+                value = int(value, 16 if value.startswith("0x") else 10)
+            if type(value) is int and value > 0:
+                metadata[key] = value
             elif key in values or key == "versionCode":
+                metadata[key] = None
                 invalid.append(key)
         elif isinstance(value, str) and (value or key == "versionName"):
             metadata[key] = value
@@ -789,9 +792,11 @@ def aapt2_manifest(ctx, aab, tool):
                     elements.pop()
                 elements.append((indent, element[1]))
                 continue
-            attr = re.fullmatch(r'\s*A: (?:[\w]+:)?(\w+)(?:\(0x([0-9a-fA-F]+)\))?=(.*)', line)
+            attr = re.fullmatch(r'\s*A: (?:(?:android|http://schemas.android.com/apk/res/android):)?(\w+)(?:\(0x([0-9a-fA-F]+)\))?=(.*)', line)
             if not attr or attr[1] not in fields:
                 continue
+            while elements and elements[-1][0] >= indent:
+                elements.pop()
             key, resource = fields[attr[1]]
             scope = [name for _, name in elements]
             expected = ["manifest", "uses-sdk"] if key in ("minSdk", "targetSdk") else ["manifest"]
