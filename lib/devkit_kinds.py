@@ -774,6 +774,8 @@ def verify_aab_signature(ctx, signer, aab, password):
         if re.fullmatch(r"jar verified(?:\.|, with signer errors\.)", line, re.I):
             state["verified"] = True
             return
+        if re.fullmatch(r"Re-run with the -verbose and -certs options for more details\.", line, re.I):
+            return
         if re.fullmatch(r"(?:Error|Warning):", line, re.I):
             state["rejected"] |= state["pending"]
             state["pending"] = True

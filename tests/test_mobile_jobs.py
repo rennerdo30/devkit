@@ -336,6 +336,7 @@ This jar contains entries whose signer certificate is self-signed.
 Warning:
 This jar contains signatures that do not include a timestamp. Without a timestamp, users may not be able to validate this jar after any of the signer certificates expire (as early as 2054-03-21).
 POSIX file permission and/or symlink attributes detected. These attributes are ignored when signing and are not protected by the signature.
+Re-run with the -verbose and -certs options for more details.
 """
 
     @classmethod
@@ -524,6 +525,10 @@ POSIX file permission and/or symlink attributes detected. These attributes are i
     def test_verify_rejects_invalid_exit_marker_and_unaccompanied_chain_error(self):
         cases = [(self.UPLOAD_VERIFY_OUTPUT, code) for code in (1, 8, 16)]
         cases += [(self.UPLOAD_VERIFY_OUTPUT.replace('jar verified, with signer errors.', ''), 4),
+                  ('Re-run with the -verbose and -certs options for more details.', 0),
+                  ('jar verified.\nRe-run with the -verbose and -certs options for more details.', 4),
+                  (self.UPLOAD_VERIFY_OUTPUT + 'Re-run with the -verbose and -certs options for more details. unsigned entries', 0),
+                  ('jar verified.\nWarning:\nRe-run with the -verbose and -certs options for more details.', 0),
                   (self.UPLOAD_VERIFY_OUTPUT.replace(
                       'This jar contains entries whose signer certificate is self-signed.\n', ''), 4),
                   (self.UPLOAD_VERIFY_OUTPUT.replace('self-signed.', 'self-signed. unsigned entries'), 4),
