@@ -60,6 +60,20 @@ class McpSchemaTests(unittest.TestCase):
             self.assertEqual(len(enum), len(set(enum)))
             self.assertEqual(enum, expected)
 
+    def test_app_store_targets_and_packaging_params_are_advertised(self):
+        schema = next(t["inputSchema"] for t in self.tools() if t["name"] == "devkit_queue")
+        self.assertIn("tvos", schema["properties"]["target"]["enum"])
+        self.assertIn("mas-pkg", schema["properties"]["kind"]["enum"])
+        params = schema["properties"]["params"]["properties"]
+        self.assertEqual(params["profile"]["type"], "string")
+        self.assertFalse(params["entitlement_values"]["additionalProperties"])
+        validator = Draft202012Validator(schema)
+        validator.validate({"project": "example", "commit": "none", "kind": "archive", "target": "tvos",
+                            "params": {"project": "tvOS/Unity-iPhone.xcodeproj", "export_method": "app-store-connect"}})
+        validator.validate({"project": "example", "commit": "none", "kind": "mas-pkg", "target": "macos",
+                            "params": {"from_job": "source-job", "app": "Example.app", "profile": "store.provisionprofile",
+                                       "entitlement_values": {"com.apple.security.network.client": True}}})
+
     def test_host_parameter_does_not_leak_into_hosts_or_templates(self):
         tools = {name: schema for name, _, schema in self.server.MCP_TOOLS}
         self.assertNotIn("host", tools["hosts"]["properties"])
