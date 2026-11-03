@@ -263,11 +263,11 @@ MCP_TOOLS = [
     ("signing", "Code signing identities, provisioning profile count, App Store Connect / notary credentials configured.", O),
     ("queue", "Queue a job (FIFO per host): build, test, archive, release (TestFlight / notarized macOS), deploy to an iPhone or "
               "simulator, launch with arguments, profile with Instruments, screenshot, crashlogs, unity (executeMethod builds/compile gates "
-              "or mode=test), unity-test (EditMode/PlayMode), or shell. Unity always runs hidden batchmode with one host slot and a hard timeout. commit may be a "
+              "or mode=test), unity-test (EditMode/PlayMode), aab-sign (Android AAB signing from an earlier job), or shell. Unity supports project_dir, collect, args and host unity_env, and runs hidden batchmode with one host slot and a hard timeout. commit may be a "
               "SHA, branch or tag. The result names the host that runs it; pass that host to status/log/artifacts.",
      {"type": "object", "properties": {"project": S, "repo": S, "commit": S, "kind": {"type": "string", "enum": list(dk.KINDS)},
                                        "target": {"type": "string", "enum": list(dk.devkit_kinds.TARGETS)}, "device": S,
-                                       "args": S, "params": {"type": "object", "properties": dk.devkit_kinds.UNITY_PARAMS,
+                                       "args": S, "params": {"type": "object", "properties": dict(dk.devkit_kinds.UNITY_PARAMS, **dk.devkit_kinds.AAB_SIGN_PARAMS),
                                                              "additionalProperties": True,
                                                              "description": "Unity: executeMethod (default) requires method and forbids test_platform; test requires test_platform and forbids method/quit. unity-test defaults to test. Unknown Unity params are rejected by the server before queueing. Other kinds accept their documented params from devkit_kinds."}},
       "required": ["project", "commit", "kind"]}),

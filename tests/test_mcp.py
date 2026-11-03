@@ -59,11 +59,28 @@ class McpUnityTests(unittest.TestCase):
         tools = self.rpc("tools/list")["tools"]
         queue = next(t["inputSchema"] for t in tools if t["name"] == "devkit_queue")
         self.assertIn("unity-test", queue["properties"]["kind"]["enum"])
+        self.assertIn("aab-sign", queue["properties"]["kind"]["enum"])
+        self.assertIn("android", queue["properties"]["target"]["enum"])
         props = queue["properties"]["params"]["properties"]
         self.assertEqual(props["quit"]["type"], "boolean")
         self.assertEqual(props["extra"]["type"], "array")
         self.assertEqual(props["test_platform"]["enum"], ["EditMode", "PlayMode"])
         self.assertFalse({"allOf", "oneOf", "anyOf"} & queue.keys())
+        self.assertNotIn("if", queue)
+        for key in ("project_dir", "collect", "args", "from_job", "aab", "keystore_path", "alias", "keychain_service", "keychain_account"):
+            self.assertIn(key, props)
+
+    def test_invalid_signing_jobs_rejected_before_worker(self):
+        params = {"from_job": "source", "aab": "game.aab", "keystore_path": "/path/to/signing.keystore",
+                  "alias": "upload", "keychain_service": "example-signing", "keychain_account": "upload"}
+        for target, override in (("ios", {}), ("android", {"aab": "../game.aab"}),
+                                 ("android", {"password": "fixture-secret"}), ("android", {"alias": "-unsafe"})):
+            with self.subTest(target=target, override=override), patch.object(self.dk.subprocess, "Popen") as process:
+                result = self.call("queue", {"project": "fixture", "commit": "none", "kind": "aab-sign",
+                                             "target": target, "params": dict(params, **override)})
+                self.assertTrue(result["isError"])
+                process.assert_not_called()
+        self.assertEqual(os.listdir(self.dk.JOBS), [])
 
     def test_invalid_jobs_rejected_before_worker(self):
         for params in ({}, {"method": "Gate.Run", "quit": "false"},

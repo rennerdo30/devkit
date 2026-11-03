@@ -195,7 +195,7 @@ class UnityTests(unittest.TestCase):
         self.assertEqual(ctx.calls, [])
 
     def test_schema_contains_only_supported_params(self):
-        self.assertEqual(set(kinds.UNITY_PARAMS), {"mode", "method", "build_target", "unity_version", "quit", "nographics", "test_platform", "timeout", "extra"})
+        self.assertEqual(set(kinds.UNITY_PARAMS), {"mode", "method", "build_target", "unity_version", "quit", "nographics", "test_platform", "timeout", "extra", "project_dir", "collect", "args"})
         self.assertEqual(kinds.UNITY_PARAMS["mode"]["enum"], ["executeMethod", "test"])
         self.assertEqual(kinds.UNITY_PARAMS["test_platform"]["enum"], ["EditMode", "PlayMode"])
         self.assertEqual(kinds.UNITY_PARAMS["quit"]["type"], "boolean")

@@ -82,7 +82,7 @@ Other MCP clients can use the endpoint directly: `POST <host>:7420/mcp` with `Au
 | CLI | `bin/devkit <verb>` (`ping`, `queue`, `status`, `list`, `log`, `cancel`, `artifacts`, `devices`, `simulators`, `signing`, `kinds`) |
 
 Job kinds: `build`, `test`, `archive`, `release`, `notarize`, `deploy`, `launch`, `profile`, `screenshot`, `crashlogs`,
-`unity`, `unity-test`, `shell`, `echo`. `GET /api/kinds` documents their parameters.
+`unity`, `unity-test`, `aab-sign`, `shell`, `echo`. `GET /api/kinds` documents their parameters.
 
 ## Unity builds, compile gates and tests (0.6.0)
 
@@ -120,7 +120,10 @@ The project must contain the Unity Test Framework package and test assemblies.
 - EditMode only: `-runSynchronously`, which excludes multi-frame tests; omit it for full coverage.
 
 Unknown params, managed flags (project path, log path, results path, quit, batchmode), credential flags and malformed
-argv are rejected before queueing. Arbitrary project-specific flags require a reviewed extension of the host allow-list.
+argv are rejected before queueing. For project-specific arguments use `params.args`, for example
+`["-gameVersion", "1.0.0"]`. Each string permits only letters, digits, underscores, dots and hyphens (128 characters
+maximum, one optional leading dash). Managed flags and arguments resembling credentials are rejected. Never submit
+secrets in a job: params and argv are visible in job records and logs. `extra` retains its existing allow-list.
 See the official [Editor command-line reference](https://docs.unity3d.com/6000.0/Documentation/Manual/EditorCommandLineArguments.html)
 and [Test Framework command-line reference](https://docs.unity3d.com/Packages/com.unity.test-framework@1.4/manual/reference-command-line.html).
 
@@ -139,6 +142,60 @@ run, failed results or a nonzero Editor exit fail the job. Partial results remai
 Use `devkit_artifacts` or `GET /api/jobs/<id>/artifacts` for sizes and SHA-256. Use `devkit_read_artifact` for XML,
 summary and logs, or download `GET /api/jobs/<id>/artifacts/<path>` (streaming and byte ranges supported).
 `devkit_log` and the existing log API retain live output. Pass the returned host to MCP queries for a forwarded job.
+
+### Nested projects and exported builds
+
+Set `params.project_dir` for a Unity project below the repository root. It must be a relative directory containing
+`ProjectSettings/ProjectVersion.txt`, even if `unity_version` is specified. Absolute paths, `..` components and symlinks
+escaping the checkout are rejected. Omitting it preserves the existing root-project behavior.
+
+For build methods that write outside `DEVKIT_ARTIFACTS`, `params.collect` copies repo-relative files or directories
+after a successful Editor run (and passing results for test jobs). Each output keeps its last path component.
+Missing paths, traversal, escaping descendant symlinks, cycles and artifact-name collisions fail clearly. Copies use
+APFS clones where available, with a normal-copy fallback. Paths are relative to the repo, including when project_dir is set.
+
+```json
+{"project":"game","repo":"https://github.com/OWNER/GAME.git","commit":"EXACT_SHA","kind":"unity",
+ "params":{"project_dir":"unity","method":"Build.ExportIOS","build_target":"iOS",
+           "args":["-gameVersion","1.0.0"],"collect":["unity/Builds/iOS"]}}
+```
+
+Queue `archive` with `target: "ios"` and params such as
+`{"from_job":"SOURCE_JOB_ID","project":"iOS/Unity-iPhone.xcodeproj","scheme":"Unity-iPhone","export_method":"app-store-connect"}`
+to produce an IPA. Automatic provisioning and the configured `asc_api_key` authentication continue to work as before.
+
+An owner can allow environment values for all Unity Editor runs in host `config.json`:
+
+```json
+{"unity_env":{"UNITY_TOOLS_PYTHON":"/path/to/venv/bin/python"}}
+```
+
+Only host configuration supplies this allow-list; jobs cannot submit `env`. Values must be strings without control
+characters (maximum 4096 characters). Values whose variable names resemble secrets are masked in Editor output.
+The interpreter and its environment must already exist on the build host.
+
+### Signed Android bundles
+
+Use a Unity Android build method with `collect` to retain its unsigned or previously signed AAB, then queue:
+
+```json
+{"project":"game","commit":"none","kind":"aab-sign","target":"android",
+ "params":{"from_job":"SOURCE_JOB_ID","aab":"Android/game.aab",
+           "keystore_path":"/path/to/signing.keystore","alias":"upload",
+           "keychain_service":"example-signing","keychain_account":"upload"}}
+```
+
+The source job must have succeeded on the same host. `aab` stays inside its artifacts; the keystore must be a regular
+host file outside the job checkout. No checkout or Xcode is needed. A JDK is located using `JAVA_HOME`, then
+`/usr/libexec/java_home` (or tools on PATH when no Java home is available). The key's store and key passwords must
+match the generic password already provisioned in Keychain under the given service/account.
+
+The job rewrites a copy, stripping `META-INF/*.SF`, `*.RSA`, `*.EC`, `*.DSA` while retaining `MANIFEST.MF`, signs with
+SHA256withRSA/SHA-256, then runs `jarsigner -verify -certs`. The password is captured in memory, supplied only through
+the signing child's environment and masked from its output; it is never added to argv, job params or artifacts.
+The resulting AAB and `aab-sign.json` contain its SHA-256, byte size and signer certificate SHA-256 from `keytool`.
+If a `bundletool` executable is on PATH, the report also includes available package/versionCode/versionName fields;
+otherwise it records a clear metadata skip note. This kind signs locally and does not upload to a store.
 
 ### Tests
 

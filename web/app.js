@@ -25,8 +25,8 @@ const T = {
     copy: "Copy", copied: "Copied", done: "Done", ownerToken: "From config.json on the Mac", you: "you",
     st: { running: "Running", queued: "Waiting", succeeded: "Succeeded", failed: "Failed", cancelled: "Cancelled" },
     k: { build: "Build", test: "Test", deploy: "Install", launch: "Launch", profile: "Profile", screenshot: "Screenshot", archive: "Archive",
-         release: "Release", notarize: "Notarize", crashlogs: "Crash logs", unity: "Unity build", shell: "Shell", echo: "Echo" },
-    tg: { ios: "iPhone / iPad", "ios-sim": "Simulator", macos: "Mac" },
+         release: "Release", notarize: "Notarize", crashlogs: "Crash logs", unity: "Unity build", "aab-sign": "Sign Android AAB", shell: "Shell", echo: "Echo" },
+    tg: { ios: "iPhone / iPad", "ios-sim": "Simulator", macos: "Mac", android: "Android" },
     nowRunning: "Running now", nothingWaiting: "Nothing is waiting.", waitingN: "{n} waiting", idleTitle: "Nothing is running", idleText: "The Mac is free. Start something:", upNext: "Up next",
     recent: "Recent results", agents: "Connected", noAgents: "Nobody else is connected.", vitals: "Mac right now", feed: "What happened",
     noFeed: "Nothing has happened yet.", openJob: "Open job", stepOf: "step {a} of {b}", elapsed: "elapsed", took: "took", ago: "ago",
@@ -109,8 +109,8 @@ const T = {
     copy: "Kopieren", copied: "Kopiert", done: "Fertig", ownerToken: "Aus config.json auf dem Mac", you: "du",
     st: { running: "Läuft", queued: "Wartet", succeeded: "Erfolgreich", failed: "Fehlgeschlagen", cancelled: "Abgebrochen" },
     k: { build: "Build", test: "Test", deploy: "Installieren", launch: "Starten", profile: "Profilieren", screenshot: "Bildschirmfoto", archive: "Archivieren",
-         release: "Veröffentlichen", notarize: "Notarisieren", crashlogs: "Absturzberichte", unity: "Unity-Build", shell: "Shell", echo: "Echo" },
-    tg: { ios: "iPhone / iPad", "ios-sim": "Simulator", macos: "Mac" },
+         release: "Veröffentlichen", notarize: "Notarisieren", crashlogs: "Absturzberichte", unity: "Unity-Build", "aab-sign": "Android-AAB signieren", shell: "Shell", echo: "Echo" },
+    tg: { ios: "iPhone / iPad", "ios-sim": "Simulator", macos: "Mac", android: "Android" },
     nowRunning: "Läuft gerade", nothingWaiting: "Nichts wartet.", waitingN: "{n} wartend", idleTitle: "Nichts läuft", idleText: "Der Mac ist frei. Etwas starten:", upNext: "Als Nächstes",
     recent: "Letzte Ergebnisse", agents: "Verbunden", noAgents: "Sonst ist niemand verbunden.", vitals: "Mac gerade", feed: "Was passiert ist",
     noFeed: "Noch ist nichts passiert.", openJob: "Job öffnen", stepOf: "Schritt {a} von {b}", elapsed: "vergangen", took: "Dauer", ago: "her",
@@ -1066,7 +1066,7 @@ function openCustom() {
       ${field("project", t("projectName"), input("project", "", 'required pattern="[A-Za-z0-9._\\-]+"'))}
       ${field("repo", t("pRepo"), input("repo", ""), { full: true })}
       ${field("commit", t("branch"), input("commit", "none", 'required'))}
-      ${field("target", t("target"), select("target", [["", "–"], ["ios", tname("ios")], ["ios-sim", tname("ios-sim")], ["macos", tname("macos")]], ""))}
+      ${field("target", t("target"), select("target", [["", "–"], ["ios", tname("ios")], ["ios-sim", tname("ios-sim")], ["macos", tname("macos")], ["android", tname("android")]], ""))}
       ${field("device", t("device"), select("device", [["", "–"]].concat(deviceOptions("ios"), deviceOptions("ios-sim")), ""), { full: true })}
       ${field("args", t("command"), `<textarea id="f-args" name="args" spellcheck="false"></textarea>`, { full: true })}
       ${field("params", t("params"), `<textarea id="f-params" name="params" spellcheck="false" placeholder='{"scheme": "Game"}'></textarea>`, { full: true, hint: "" })}

@@ -11,7 +11,7 @@ JOBS, WORK, ARTIFACTS, DERIVED, INPUTS = (os.path.join(ROOT, d) for d in ("jobs"
 CONFIG = os.path.join(ROOT, "config.json")
 LOCK = os.path.join(ROOT, "worker.lock")
 KINDS = tuple(sorted(devkit_kinds.KINDS))
-NO_CHECKOUT_KINDS = ("echo", "screenshot", "crashlogs", "launch")
+NO_CHECKOUT_KINDS = ("echo", "screenshot", "crashlogs", "launch", "aab-sign")
 UNITY_EDITORS = devkit_kinds.UNITY_EDITORS
 PROFILES_DIR = os.path.expanduser("~/Library/Developer/Xcode/UserData/Provisioning Profiles")
 DEFAULT_STEP_TIMEOUT = 3 * 3600
@@ -191,13 +191,19 @@ class Ctx:
                      "-authenticationKeyID", key["key_id"], "-authenticationKeyIssuerID", key["issuer_id"]]
         return args
 
-    def run(self, cmd, cwd=None, env=None, check=True, timeout=None, timeout_ok=False, log_cmd=True, out=None):
+    def run(self, cmd, cwd=None, env=None, check=True, timeout=None, timeout_ok=False, log_cmd=True, out=None,
+            capture_only=False, redact_values=()):
         """Run one step in its own process group, streaming output to the job log; out (a list) also collects it."""
         if os.path.exists(self.cancel_file):
             raise Cancelled()
+        def mask(value):
+            for secret in redact_values:
+                if secret:
+                    value = value.replace(secret, "<redacted>")
+            return value
         if log_cmd:
-            self.log("$ " + redact_cmd(cmd))
-        step = {"label": step_label(cmd) if log_cmd else "shell", "started": time.time(), "finished": None, "exit": None,
+            self.log("$ " + mask(redact_cmd(cmd)))
+        step = {"label": mask(step_label(cmd)) if log_cmd else "shell", "started": time.time(), "finished": None, "exit": None,
                 "expected_seconds": timeout if timeout_ok else None}
         self.st.setdefault("steps", []).append(step)
         full_env = dict(os.environ, DEVKIT_JOB=self.st["id"], DEVKIT_ARTIFACTS=self.art, DEVKIT_MUTE="1", **(env or {}))
@@ -216,6 +222,7 @@ class Ctx:
         timed_out, cancelled, stopping = False, False, None
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         pending = ""
+        redaction_tail = max([len(v) for v in redact_values if v] or [0])
         os.set_blocking(p.stdout.fileno(), False)
         children = ProcessChildren(p.pid)
         next_snapshot = 0
@@ -246,14 +253,21 @@ class Ctx:
             nonlocal pending
             pending += decoder.decode(data, final=final)
             # Bound memory for a tool that never emits a newline.
-            while "\n" in pending or len(pending) >= 65536:
+            while "\n" in pending or len(pending) >= 65536 + redaction_tail:
+                pending = mask(pending)
+                if "\n" not in pending and len(pending) < 65536 + redaction_tail:
+                    break
                 end = pending.find("\n") + 1 if "\n" in pending else 65536
+                # The lookahead tail retains secrets split across bounded chunks.
                 line, pending = pending[:end], pending[end:]
-                self.logf.write(redact(line))
+                if not capture_only:
+                    self.logf.write(redact(line))
                 if out is not None:
                     out.append(line)
             if final and pending:
-                self.logf.write(redact(pending))
+                pending = mask(pending)
+                if not capture_only:
+                    self.logf.write(redact(pending))
                 if out is not None:
                     out.append(pending)
                 pending = ""
@@ -563,6 +577,13 @@ def v_queue(a):
             devkit_kinds.validate_unity_params(params, test_only=a.kind == "unity-test")
         except ValueError as e:
             raise Fail(str(e)) from e
+    if a.kind == "aab-sign":
+        try:
+            devkit_kinds.validate_aab_sign_params(params)
+        except ValueError as e:
+            raise Fail(str(e)) from None
+        if a.target != "android":
+            raise Fail("aab-sign target must be android")
     jobs = all_jobs()
     jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     os.makedirs(os.path.join(JOBS, jid))
