@@ -3,7 +3,7 @@ import json, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 PLATFORM = {"darwin": "macos", "win32": "windows"}.get(sys.platform, "linux")
-TARGET_PLATFORM = {"ios": "macos", "ios-sim": "macos", "macos": "macos", "windows": "windows", "linux": "linux"}
+TARGET_PLATFORM = {"ios": "macos", "ios-sim": "macos", "macos": "macos", "android": "macos", "windows": "windows", "linux": "linux"}
 HOP_HEADER = "X-Devkit-Hop"
 STATUS_TTL = 3
 PING_TIMEOUT = 3

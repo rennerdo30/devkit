@@ -7,18 +7,30 @@ Common params (job "params" object):
   extra                 list of extra xcodebuild arguments
   from_job              id of an earlier succeeded job on this host whose artifacts are used as input, e.g. a
                         unity job's Xcode export: {"from_job": "<id>", "project": "iOS/Unity-iPhone.xcodeproj"}
-Targets (job "target"): ios (device), ios-sim, macos.
+Unity params: project_dir (repo-relative, default root), collect (repo-relative outputs copied by basename),
+  args (conservative project-specific argv). Host config unity_env supplies Editor environment variables.
+aab-sign params: from_job, aab (relative artifact path), keystore_path (host file outside checkout),
+  alias, keychain_service, keychain_account. Passwords are read from Keychain only at execution time.
+Targets (job "target"): ios (device), ios-sim, macos; android for aab-sign.
 """
-import glob, json, math, os, plistlib, re
+import glob, hashlib, json, math, os, plistlib, re, shutil, stat, subprocess, time, zipfile
 import xml.etree.ElementTree as ET
 
-TARGETS = ("ios", "ios-sim", "macos")
+XCODE_TARGETS = ("ios", "ios-sim", "macos")
+TARGETS = XCODE_TARGETS + ("android",)
 UNITY_EDITORS = "/Applications/Unity/Hub/Editor"
 DEFAULT_TEMPLATE = "Time Profiler"
 DEFAULT_PROFILE_SECONDS = 30
 DEFAULT_LAUNCH_SECONDS = 60
 UNITY_MAX_TIMEOUT = 4 * 3600
+# Fixed runner/kind outputs must never be supplied by collect, even before they exist.
+RESERVED_ARTIFACT_NAMES = frozenset(name.casefold() for name in (
+    "job.log", "job.json", "TestResults.xml", "test-summary.json", "echo.txt",
+    "profile-summary.json", "aab-sign.json"))
 UNITY_PARAMS = {
+    "project_dir": {"type": "string", "description": "Repo-relative Unity directory containing ProjectSettings/ProjectVersion.txt; defaults to repo root."},
+    "collect": {"type": "array", "items": {"type": "string"}, "description": "Repo-relative outputs copied into artifacts by last path component after success."},
+    "args": {"type": "array", "items": {"type": "string"}, "description": "Project-specific argv, e.g. -gameVersion 1.0.0. Conservative characters only; managed flags and credentials rejected."},
     "mode": {"type": "string", "enum": ["executeMethod", "test"], "default": "executeMethod"},
     "method": {"type": "string", "pattern": r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$", "description": "Static Editor method for executeMethod builds or compile gates."},
     "build_target": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*$", "description": "Optional Unity -buildTarget; omitted for the project's active target."},
@@ -33,6 +45,158 @@ UNITY_PARAMS = {
 UNITY_EXTRA_SWITCHES = {"-accept-apiupdate", "-force-metal", "-force-glcore"}
 UNITY_TEST_SWITCHES = {"-runSynchronously"}
 UNITY_TEST_VALUES = {"-testFilter", "-testCategory", "-assemblyNames"}
+SECRET_KEY = re.compile(r"pass|secret|token|credential|username|serial|license|key|auth|bearer", re.I)
+UNITY_MANAGED = {x.lower() for x in ("-projectPath", "-logFile", "-batchmode", "-quit", "-executeMethod", "-buildTarget", "-nographics", "-runTests", "-testPlatform", "-testResults", "-username", "-password", "-serial")}
+
+
+def relative_path(value, allow_root=False):
+    if (not isinstance(value, str) or not value or os.path.isabs(value) or
+            "\\" in value or any(ord(c) < 32 for c in value) or ".." in value.split("/") or
+            (not allow_root and os.path.normpath(value) == ".")):
+        raise ValueError("path must be repo-relative without traversal")
+    return value
+
+
+def contained_path(ctx, base, rel, allow_root=False):
+    try:
+        relative_path(rel, allow_root)
+    except ValueError as e:
+        raise ctx.Fail(str(e)) from None
+    root, path = os.path.realpath(base), os.path.realpath(os.path.join(base, rel))
+    if os.path.commonpath([root, path]) != root:
+        raise ctx.Fail("path escapes its allowed directory")
+    if not os.path.exists(path):
+        raise ctx.Fail("required path is missing: " + rel)
+    return path
+
+
+def validate_collect_tree(ctx, root, path, active=None, check=None):
+    """Validate the copied tree, retaining only relative links inside this copy."""
+    if check is not None:
+        check()
+    active = set() if active is None else active
+    if os.path.islink(path) and os.path.isabs(os.readlink(path)):
+        raise ctx.Fail("collect contains an absolute symlink escape")
+    real = os.path.realpath(path)
+    # Canonicalize the parent (e.g. system temp aliases), never a copied root link.
+    boundary = os.path.join(os.path.realpath(os.path.dirname(root)), os.path.basename(root))
+    if os.path.commonpath([boundary, real]) != boundary:
+        raise ctx.Fail("collect contains a symlink escape")
+    if os.path.isdir(real):
+        if real in active:
+            raise ctx.Fail("collect contains a symlink cycle")
+        for name in os.listdir(real):
+            validate_collect_tree(ctx, root, os.path.join(real, name), active | {real}, check)
+    elif not os.path.isfile(real):
+        raise ctx.Fail("collect requires existing regular files or directories")
+
+
+def remove_collect_copy(path):
+    if os.path.islink(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
+def copy_collect_entry(ctx, parent_fd, name, dest, relative, check):
+    """Read only pinned descriptors; source links are data, never traversal paths."""
+    check()
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISLNK(info.st_mode):
+        target = os.readlink(name, dir_fd=parent_fd)
+        if os.path.isabs(target):
+            raise ctx.Fail("collect contains an absolute symlink escape")
+        resolved = os.path.normpath(os.path.join(os.path.dirname(relative), target))
+        if relative == "." or resolved == ".." or resolved.startswith("../"):
+            raise ctx.Fail("collect contains a symlink escape")
+        os.symlink(target, dest)
+        return
+    # O_NONBLOCK prevents a regular-file-to-FIFO swap from blocking before fstat.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if stat.S_ISDIR(info.st_mode):
+        flags |= os.O_DIRECTORY
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            os.mkdir(dest)
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    copy_collect_entry(ctx, fd, entry.name, os.path.join(dest, entry.name),
+                                       os.path.join(relative, entry.name), check)
+            os.chmod(dest, stat.S_IMODE(info.st_mode))
+        elif stat.S_ISREG(info.st_mode):
+            with open(dest, "xb") as output:
+                while True:
+                    check()
+                    chunk = os.read(fd, 1024 * 1024)
+                    check()
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                output.flush()
+                os.fchmod(output.fileno(), stat.S_IMODE(info.st_mode))
+        else:
+            raise ctx.Fail("collect requires existing regular files or directories")
+        check()
+    finally:
+        os.close(fd)
+
+
+def collect_unity(ctx):
+    paths = ctx.p.get("collect", [])
+    if not paths:
+        return
+    deadline = getattr(ctx, "unity_deadline", None)
+    if deadline is None:
+        deadline = time.monotonic() + unity_timeout(ctx.p)
+    def check():
+        if os.path.exists(getattr(ctx, "cancel_file", "")):
+            raise ctx.Cancelled()
+        if time.monotonic() >= deadline:
+            raise ctx.Fail("Unity job timed out during collect")
+    work_fd = os.open(ctx.work, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for rel in paths:
+            check()
+            contained_path(ctx, ctx.work, rel)
+            parts = os.path.normpath(rel).split(os.sep)
+            dest = os.path.join(ctx.art, parts[-1])
+            if parts[-1].casefold() in RESERVED_ARTIFACT_NAMES:
+                raise ctx.Fail("collect artifact name is reserved: " + parts[-1])
+            if any(name.casefold() == parts[-1].casefold() for name in os.listdir(ctx.art)):
+                raise ctx.Fail("collect artifact name already exists: " + parts[-1])
+            parent_fd = os.dup(work_fd)
+            try:
+                for name in parts[:-1]:
+                    check()
+                    child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                    os.close(parent_fd)
+                    parent_fd = child_fd
+                copy_collect_entry(ctx, parent_fd, parts[-1], dest, ".", check)
+                # Resolve only the private copy to reject dangling links and cycles,
+                # including escapes through chains of otherwise relative links.
+                validate_collect_tree(ctx, dest, dest, check=check)
+                check()
+            except BaseException as e:
+                remove_collect_copy(dest)
+                if isinstance(e, OSError):
+                    raise ctx.Fail("collect source changed or could not be copied") from None
+                raise
+            finally:
+                os.close(parent_fd)
+    finally:
+        os.close(work_fd)
+
+
+def unity_env(ctx):
+    env = getattr(ctx, "cfg", {}).get("unity_env", {})
+    if not isinstance(env, dict) or any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) or
+                                        not isinstance(v, str) or any(ord(c) < 32 for c in v) or len(v) > 4096 for k, v in env.items()):
+        raise ctx.Fail("host unity_env must map environment names to string values")
+    return dict(env)
 
 
 def unity_timeout(params):
@@ -49,6 +213,23 @@ def validate_unity_params(params, test_only=False):
     unknown = set(params) - set(UNITY_PARAMS)
     if unknown:
         raise ValueError("unknown Unity params: " + ", ".join(sorted(unknown)))
+    if "project_dir" in params:
+        relative_path(params["project_dir"], allow_root=True)
+    collect = params.get("collect", [])
+    if not isinstance(collect, list):
+        raise ValueError("Unity collect must be a list of relative paths")
+    for path in collect:
+        relative_path(path)
+        if os.path.basename(os.path.normpath(path)).casefold() in RESERVED_ARTIFACT_NAMES:
+            raise ValueError("collect artifact name is reserved")
+    args = params.get("args", [])
+    if not isinstance(args, list):
+        raise ValueError("Unity args must be a list of strings")
+    for arg in args:
+        if (not isinstance(arg, str) or len(arg) > 128 or not re.fullmatch(r"-?[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", arg) or
+                arg.lower() in UNITY_MANAGED or SECRET_KEY.search(arg) or
+                (not arg.startswith("-") and len(arg) >= 32 and re.fullmatch(r"[A-Za-z0-9_.-]+", arg))):
+            raise ValueError("Unity args contains an unsafe argument or credential")
     mode = params.get("mode", "test" if test_only else "executeMethod")
     if mode not in ("executeMethod", "test") or (test_only and mode != "test"):
         raise ValueError("Unity mode must be executeMethod or test (unity-test requires test)")
@@ -107,7 +288,7 @@ def need(ctx, *keys):
         raise ctx.Fail("missing params: " + ", ".join(missing))
 
 
-def need_target(ctx, allowed=TARGETS):
+def need_target(ctx, allowed=XCODE_TARGETS):
     if ctx.target not in allowed:
         raise ctx.Fail("target must be one of: " + ", ".join(allowed))
 
@@ -425,14 +606,17 @@ def k_unity(ctx):
     and allow-listed extra argv (-accept-apiupdate, -force-metal, -force-glcore; tests also -testFilter,
     -testCategory, -assemblyNames and EditMode-only -runSynchronously). Editor version defaults to
     ProjectSettings/ProjectVersion.txt. $DEVKIT_ARTIFACTS holds outputs, TestResults.xml, test-summary.json
-    and job.log. FIFO with one Unity slot per host owner account, shared across data directories."""
+    and job.log. project_dir selects a contained repo subdirectory; collect copies repo outputs by basename
+    after success; args passes conservative project flags. Host unity_env supplies environment variables.
+    FIFO with one Unity slot per host owner account, shared across data directories."""
     unity(ctx)
 
 
 def k_unity_test(ctx):
     """Alias for unity with mode=test: test_platform=EditMode|PlayMode required. Hidden batchmode,
     optional build_target/nographics/unity_version/allow-listed extra/timeout; results and job.log are artifacts.
-    The test runner exits itself; method and quit are rejected. Uses the same host Unity slot."""
+    project_dir, collect, args and host unity_env work as for unity. The test runner exits itself;
+    method and quit are rejected. Uses the same host Unity slot."""
     unity(ctx, test_only=True)
 
 
@@ -441,9 +625,18 @@ def unity(ctx, test_only=False):
         mode, extra = validate_unity_params(ctx.p, test_only)
     except ValueError as e:
         raise ctx.Fail(str(e)) from e
+    project = ctx.work
+    if "project_dir" in ctx.p:
+        project = contained_path(ctx, ctx.work, ctx.p["project_dir"], allow_root=True)
+        if not os.path.isdir(project):
+            raise ctx.Fail("Unity project_dir must be a directory")
+        marker = contained_path(ctx, ctx.work, os.path.join(ctx.p["project_dir"], "ProjectSettings/ProjectVersion.txt"))
+        if not os.path.isfile(marker):
+            raise ctx.Fail("Unity project requires ProjectSettings/ProjectVersion.txt")
     version = ctx.p.get("unity_version")
     if not version:
-        with open(inside(ctx, "ProjectSettings/ProjectVersion.txt")) as f:
+        marker = contained_path(ctx, ctx.work, os.path.join(ctx.p.get("project_dir", "."), "ProjectSettings/ProjectVersion.txt"))
+        with open(marker) as f:
             match = re.search(r"m_EditorVersion:\s*(\S+)", f.read())
         if not match:
             raise ctx.Fail("ProjectVersion.txt has no m_EditorVersion")
@@ -454,7 +647,10 @@ def unity(ctx, test_only=False):
     if not os.path.isfile(editor):
         installed = sorted(os.listdir(UNITY_EDITORS)) if os.path.isdir(UNITY_EDITORS) else []
         raise ctx.Fail("Unity %s is not installed (have: %s)" % (version, ", ".join(installed)))
-    cmd = [editor, "-batchmode", "-projectPath", ctx.work, "-logFile", "-"]
+    cmd = [editor, "-batchmode", "-projectPath", project, "-logFile", "-"]
+    env = unity_env(ctx)
+    options = {"env": env, "redact_values": [v for k, v in env.items() if SECRET_KEY.search(k)]} if env else {}
+    extra = extra + ctx.p.get("args", [])
     if ctx.p.get("nographics", False):
         cmd.append("-nographics")
     if ctx.p.get("build_target"):
@@ -462,11 +658,12 @@ def unity(ctx, test_only=False):
     if mode == "executeMethod":
         if ctx.p.get("quit", True):
             cmd.append("-quit")
-        ctx.run(cmd + ["-executeMethod", ctx.p["method"]] + extra, timeout=unity_timeout(ctx.p))
+        ctx.run(cmd + ["-executeMethod", ctx.p["method"]] + extra, timeout=unity_timeout(ctx.p), **options)
+        collect_unity(ctx)
         return
     results = os.path.join(ctx.art, "TestResults.xml")
     code = ctx.run(cmd + ["-runTests", "-testPlatform", ctx.p["test_platform"], "-testResults", results] + extra,
-                   check=False, timeout=unity_timeout(ctx.p))
+                   check=False, timeout=unity_timeout(ctx.p), **options)
     summary = {"platform": ctx.p["test_platform"], "exit_code": code}
     error = None
     try:
@@ -490,6 +687,134 @@ def unity(ctx, test_only=False):
         raise ctx.Fail("Unity tests exited with code %s; inspect TestResults.xml and job.log" % code)
     if error:
         raise ctx.Fail(error)
+    collect_unity(ctx)
+
+
+AAB_SIGN_PARAMS = {key: {"type": "string", "description": description} for key, description in {
+    "from_job": "Succeeded source job on this host.", "aab": "Relative AAB path inside source artifacts.",
+    "keystore_path": "Existing host keystore file outside the job checkout.", "alias": "Signing key alias.",
+    "keychain_service": "Keychain generic password service.", "keychain_account": "Keychain generic password account."
+}.items()}
+
+
+def validate_aab_sign_params(params):
+    if not isinstance(params, dict) or set(params) != set(AAB_SIGN_PARAMS):
+        raise ValueError("aab-sign requires exactly: " + ", ".join(AAB_SIGN_PARAMS))
+    if any(not isinstance(v, str) or not v or v.startswith("-") or any(ord(c) < 32 for c in v) for v in params.values()):
+        raise ValueError("aab-sign params must be non-empty strings without control characters or leading dashes")
+    relative_path(params["aab"])
+    if not params["aab"].lower().endswith(".aab"):
+        raise ValueError("aab-sign requires an .aab file")
+
+
+def java_tools(ctx):
+    home = os.environ.get("JAVA_HOME")
+    if not home and os.path.isfile("/usr/libexec/java_home"):
+        result = subprocess.run(["/usr/libexec/java_home"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        if result.returncode == 0:
+            home = result.stdout.decode("utf-8", "replace").strip()
+    tools = [os.path.join(home, "bin", name) if home else shutil.which(name) for name in ("jarsigner", "keytool")]
+    if any(not tool or not os.path.isfile(tool) or not os.access(tool, os.X_OK) for tool in tools):
+        raise ctx.Fail("aab-sign requires a JDK with jarsigner and keytool (JAVA_HOME or java_home)")
+    return tools
+
+
+def strip_aab_signatures(source, dest):
+    """Stream entries into a new ZIP, retaining MANIFEST.MF and all non-signature entries."""
+    with zipfile.ZipFile(source) as src, zipfile.ZipFile(dest, "w") as out:
+        for info in src.infolist():
+            if re.fullmatch(r"META-INF/[^/]+\.(SF|RSA|EC|DSA)", info.filename, re.I):
+                continue
+            with src.open(info) as read, out.open(info, "w") as write:
+                shutil.copyfileobj(read, write, 1 << 20)
+
+
+def aab_manifest(ctx, aab):
+    tool = shutil.which("bundletool")
+    if not tool:
+        return {"manifest_note": "Package/version metadata skipped: bundletool is not installed."}
+    output = []
+    code = ctx.run([tool, "dump", "manifest", "--bundle=" + aab, "--module=base"], out=output, check=False)
+    try:
+        if code:
+            raise ValueError()
+        root = ET.fromstring("".join(output))
+        if root.tag != "manifest":
+            raise ValueError()
+        android = "{http://schemas.android.com/apk/res/android}"
+        metadata = {k: v for k, v in {"package": root.get("package"), "versionCode": root.get(android + "versionCode"),
+                                     "versionName": root.get(android + "versionName")}.items() if v is not None}
+        if len(metadata) != 3:
+            metadata["manifest_note"] = "Some package/version metadata fields were unavailable in the bundletool manifest."
+        return metadata
+    except (ValueError, ET.ParseError):
+        return {"manifest_note": "Package/version metadata skipped: bundletool manifest unavailable or invalid."}
+
+
+def k_aab_sign(ctx):
+    """Sign an Android AAB without Xcode. Required params: from_job, aab (relative artifact path),
+    keystore_path (host regular file outside checkout), alias, keychain_service, keychain_account.
+    Password is read from Keychain into child environment only. Rewrites old ZIP signature entries,
+    signs SHA256withRSA/SHA-256, verifies and writes aab-sign.json (hash, size, signer certificate SHA-256,
+    optional bundletool package/version metadata or a clear skip note). Requires a JDK."""
+    need_target(ctx, ("android",))
+    try:
+        validate_aab_sign_params(ctx.p)
+    except ValueError as e:
+        raise ctx.Fail(str(e)) from None
+    if not ctx.inputs:
+        raise ctx.Fail("aab-sign requires from_job artifacts")
+    source = contained_path(ctx, ctx.inputs, ctx.p["aab"])
+    if not os.path.isfile(source):
+        raise ctx.Fail("aab must be a regular file")
+    keystore = os.path.realpath(os.path.expanduser(ctx.p["keystore_path"]))
+    if not os.path.isfile(keystore) or os.path.commonpath([keystore, os.path.realpath(ctx.work)]) == os.path.realpath(ctx.work):
+        raise ctx.Fail("keystore_path must be a regular host file outside the job work directory")
+    signer, keytool = java_tools(ctx)
+    aab = os.path.join(ctx.art, os.path.basename(ctx.p["aab"]))
+    if os.path.lexists(aab):
+        raise ctx.Fail("AAB output already exists")
+    strip_aab_signatures(source, aab)
+    output = []
+    ctx.run(["security", "find-generic-password", "-s", ctx.p["keychain_service"], "-a", ctx.p["keychain_account"], "-w"],
+            out=output, capture_only=True, log_cmd=False)
+    password = "".join(output).rstrip("\r\n")
+    output.clear()
+    if not password or any(ord(c) < 32 for c in password) or len(password) > 4096:
+        raise ctx.Fail("Keychain returned an empty or invalid signing password")
+    try:
+        ctx.run([signer, "-keystore", keystore, "-sigalg", "SHA256withRSA", "-digestalg", "SHA-256",
+                 "-storepass:env", "DEVKIT_AAB_PASSWORD", "-keypass:env", "DEVKIT_AAB_PASSWORD", aab, ctx.p["alias"]],
+                env={"DEVKIT_AAB_PASSWORD": password}, redact_values=[password])
+        verification = {"verified": False, "warning": False}
+        def inspect_verification(line):
+            verification["verified"] |= "jar verified." in line.lower()
+            verification["warning"] |= bool(re.search(r"\b(warning|unsigned|disabled|weak)\b", line, re.I))
+        ctx.run([signer, "-J-Duser.language=en", "-J-Duser.country=US", "-verify", "-strict", "-certs", aab],
+                parse_output=inspect_verification, redact_values=[password])
+        if not verification["verified"] or verification["warning"]:
+            raise ctx.Fail("AAB signature verification failed or reported warnings")
+        fingerprints, public_keys = [], []
+        def inspect_certificate(line):
+            fingerprints.extend(re.findall(r"SHA256:\s*((?:[0-9a-fA-F]{2}:){31}[0-9a-fA-F]{2})", line))
+            public_keys.extend(re.findall(r"Subject Public Key Algorithm:\s*(\d+)-bit\s+(RSA|EC)\s+key\b", line))
+        ctx.run([keytool, "-J-Duser.language=en", "-J-Duser.country=US", "-printcert", "-jarfile", aab],
+                parse_output=inspect_certificate, redact_values=[password])
+    finally:
+        password = None
+    if not fingerprints:
+        raise ctx.Fail("keytool did not report a signer certificate SHA-256")
+    if (not public_keys or len(public_keys) != len(fingerprints) or
+            any(int(bits) < {"RSA": 2048, "EC": 256}[algorithm] for bits, algorithm in public_keys)):
+        raise ctx.Fail("signer certificate requires at least RSA 2048 or EC 256 public key")
+    digest = hashlib.sha256()
+    with open(aab, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    summary = {"sha256": digest.hexdigest(), "size": os.path.getsize(aab),
+               "signer_cert_sha256": fingerprints[0].replace(":", "").lower()}
+    summary.update(aab_manifest(ctx, aab))
+    ctx.write("aab-sign.json", json.dumps(summary, indent=2))
 
 
 KINDS = {name[2:].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("k_")}
