@@ -25,6 +25,9 @@ class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        cfg = mock.patch.object(self.runner, "config", return_value={})
+        cfg.start()
+        self.addCleanup(cfg.stop)
         self.log = io.StringIO()
         self.ctx = self.runner.Ctx({"id": "fixture", "project": "fixture"}, self.log, self.tmp.name)
         self.ctx.cancel_file = str(Path(self.tmp.name) / "cancel")

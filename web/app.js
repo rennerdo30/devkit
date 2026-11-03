@@ -179,6 +179,23 @@ const T = {
 };
 
 /* ---------------------------------------------------------------- utilities */
+Object.assign(T.en, { unityMode: "Unity action", unityMethod: "Editor method", unityTarget: "Build target (optional)",
+  unityQuit: "Exit after method", unityGraphics: "Graphics", unityTimeout: "Timeout (seconds)",
+  testPlatform: "Test platform", testFilter: "Test filter (optional)", assemblyNames: "Test assemblies (optional)",
+  unityExecute: "Build or compile gate", unityTests: "Run tests", unitySelfExit: "Method exits itself",
+  unityAutoExit: "Quit after method", graphicsOn: "Enabled", graphicsOff: "Headless (-nographics)" });
+Object.assign(T.de, { unityMode: "Unity-Aktion", unityMethod: "Editor-Methode", unityTarget: "Build-Ziel (optional)",
+  unityQuit: "Nach Methode beenden", unityGraphics: "Grafik", unityTimeout: "Zeitlimit (Sekunden)",
+  testPlatform: "Testplattform", testFilter: "Testfilter (optional)", assemblyNames: "Test-Assemblies (optional)",
+  unityExecute: "Build oder Compile-Prüfung", unityTests: "Tests ausführen", unitySelfExit: "Methode beendet sich selbst",
+  unityAutoExit: "Nach Methode beenden", graphicsOn: "Aktiviert", graphicsOff: "Ohne Grafik (-nographics)" });
+T.en.k["unity-test"] = "Unity tests";
+T.de.k["unity-test"] = "Unity-Tests";
+T.en.a.unity = ["Unity", "Builds, compile gates and Editor tests."];
+T.de.a.unity = ["Unity", "Builds, Compile-Prüfungen und Editor-Tests."];
+T.en.artifactsExpired = "Artifacts removed by retention cleanup. The job log is retained.";
+T.de.artifactsExpired = "Artefakte durch Aufbewahrungsbereinigung entfernt. Das Job-Protokoll bleibt erhalten.";
+
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
   set(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) { /* storage unavailable */ } },
@@ -609,7 +626,7 @@ const PAGES = {
       if (l.text !== this.lastText) { log.innerHTML = colorLog(l.text, this.find); this.lastText = l.text; if (this.follow) log.scrollTop = log.scrollHeight; }
       $("#jd-files").innerHTML = a.files.length ? `<ul class="files">${a.files.map(f => `<li><span class="name" title="${esc(f.path)}">${esc(f.path)}</span>
         <span style="display:flex;gap:10px;align-items:center"><span class="size">${fmtBytes(f.bytes)}</span><button class="btn small" data-file="${esc(f.path)}">${esc(t("download"))}</button></span></li>`).join("")}</ul>${a.files.some(f => /\.png$/i.test(f.path)) ? '<div class="pad" id="jd-shot"></div>' : ""}`
-        : `<div class="empty">${esc(t("noFiles"))}</div>`;
+        : `<div class="empty">${esc(t(s.artifacts_expired ? "artifactsExpired" : "noFiles"))}</div>`;
       $("#jd-files").querySelectorAll("[data-file]").forEach(b => b.onclick = () => download(id, b.dataset.file));
       const png = a.files.find(f => /\.png$/i.test(f.path));
       if (png) { const url = await artifactUrl(id, png.path); const box = $("#jd-shot"); if (box) box.innerHTML = `<img class="shot" alt="${esc(png.path)}" src="${url}">`; }
@@ -748,7 +765,7 @@ const PAGES = {
       el.innerHTML = S.hosts.map(h => { const r = h.running;
         return `<div class="panel dev"><div class="dev-top">${icon(h.platform === "macos" ? "mac" : "hosts", 30)}<b>${esc(h.name)}</b>
             <span><i class="dot ${h.online ? "on" : "off"}"></i> ${esc(h.online ? t("online") : t("offline"))} · ${esc(t("platformName." + h.platform) || "?")}${h.self ? " · " + esc(t("thisHost")) : ""}</span></div>
-          ${h.online ? `<dl class="facts">${h.chip ? `<dt>Chip</dt><dd>${esc(h.chip)}</dd>` : ""}${h.xcode ? `<dt>Xcode</dt><dd>${esc(h.xcode.replace(/ Build version.*/, ""))}</dd>` : ""}
+          ${h.online ? `<dl class="facts">${h.build ? `<dt>Devkit</dt><dd class="mono">${esc(h.build.version)} · ${esc((h.build.commit || "").slice(0, 12))}${h.build.dirty ? " *" : ""}<br>${esc(h.build.source_sha256)}</dd>` : ""}${h.chip ? `<dt>Chip</dt><dd>${esc(h.chip)}</dd>` : ""}${h.xcode ? `<dt>Xcode</dt><dd>${esc(h.xcode.replace(/ Build version.*/, ""))}</dd>` : ""}
             <dt>${esc(t("nav.jobs"))}</dt><dd>${r ? `<a href="#/jobs/${esc(r.id)}${h.self ? "" : "@" + encodeURIComponent(h.name)}">${esc(kname(r.kind) + " " + r.project)}</a> · ` : esc(t("idleHost")) + " · "}${esc((h.queue_len || 0) - (r ? 1 : 0) > 0 ? t("waitingN", { n: (h.queue_len || 0) - (r ? 1 : 0) }) : t("nothingWaiting"))}</dd></dl>`
             : `<div class="err" style="font-size:14px">${esc(h.error || "")}</div>`}
           <div class="actions">${h.self ? `<a class="btn small" href="#/mac">${esc(t("nav.mac"))}</a>` : `<a class="btn small" href="#/jobs" data-hostjobs="${esc(h.name)}">${esc(t("nav.jobs"))}</a>
@@ -876,9 +893,25 @@ const RUN = {
   screenshot: { kind: "screenshot", targets: ["ios", "ios-sim"], fields: ["target", "device"], noRepo: true },
   archive:    { kind: "archive", targets: ["ios", "macos"], fields: ["ref", "target", "export_method"] },
   release:    { kind: "release", targets: ["ios", "macos"], fields: ["ref", "target"] },
-  unity:      { kind: "unity", targets: [], fields: ["ref"] },
+  unity:      { kind: "unity", targets: [], fields: ["ref", "unity_mode", "unity_method", "unity_target", "unity_quit", "test_platform", "test_filter", "assembly_names", "unity_graphics", "unity_timeout"] },
   shell:      { kind: "shell", targets: [], fields: ["ref", "args"] },
 };
+function unityRunParams(val) {
+  const params = { mode: val("unity_mode") || "executeMethod", nographics: val("unity_graphics") === "off",
+    timeout: Number(val("unity_timeout")) };
+  if (val("unity_target")) params.build_target = val("unity_target");
+  if (params.mode === "test") {
+    params.test_platform = val("test_platform");
+    const extra = [];
+    if (val("test_filter")) extra.push("-testFilter", val("test_filter"));
+    if (val("assembly_names")) extra.push("-assemblyNames", val("assembly_names"));
+    if (extra.length) params.extra = extra;
+  } else {
+    params.method = val("unity_method");
+    params.quit = val("unity_quit") !== "false";
+  }
+  return params;
+}
 function openRun(p, action) {
   const spec = RUN[action], last = JSON.parse(store.get("devkit.run." + p.name + "." + action) || "{}");
   const v = k => last[k] ?? { ref: p.ref || "main", target: p.target || spec.targets[0], device: p.device, duration: action === "profile" ? 30 : 60, template: "Time Profiler" }[k];
@@ -894,14 +927,25 @@ function openRun(p, action) {
     template: () => field("template", t("template"), select("template", TEMPLATES.map(x => [x, x]), v("template"))),
     export_method: () => field("export_method", t("exportAs"), select("export_method", [["", t("noExport")], ["development", "development"], ["release-testing", "release-testing"], ["app-store-connect", "app-store-connect"], ["developer-id", "developer-id"]], v("export_method"))),
     args: () => field("args", t("command"), `<textarea id="f-args" name="args" spellcheck="false" required>${esc(v("args") || "")}</textarea>`, { full: true }),
+    unity_mode: () => field("unity_mode", t("unityMode"), select("unity_mode", [["executeMethod", t("unityExecute")], ["test", t("unityTests")]], v("unity_mode") || "executeMethod")),
+    unity_method: () => field("unity_method", t("unityMethod"), input("unity_method", v("unity_method") ?? p.unity_method ?? "", 'placeholder="CompileGate.Run"')),
+    unity_target: () => field("unity_target", t("unityTarget"), input("unity_target", v("unity_target") ?? p.unity_build_target ?? "")),
+    unity_quit: () => field("unity_quit", t("unityQuit"), select("unity_quit", [["true", t("unityAutoExit")], ["false", t("unitySelfExit")]], v("unity_quit") || "true")),
+    test_platform: () => field("test_platform", t("testPlatform"), select("test_platform", [["EditMode", "EditMode"], ["PlayMode", "PlayMode"]], v("test_platform") || "EditMode")),
+    test_filter: () => field("test_filter", t("testFilter"), input("test_filter", v("test_filter") || "")),
+    assembly_names: () => field("assembly_names", t("assemblyNames"), input("assembly_names", v("assembly_names") || "")),
+    unity_graphics: () => field("unity_graphics", t("unityGraphics"), select("unity_graphics", [["on", t("graphicsOn")], ["off", t("graphicsOff")]], v("unity_graphics") || "on")),
+    unity_timeout: () => field("unity_timeout", t("unityTimeout"), input("unity_timeout", v("unity_timeout") || 14400, 'type="number" min="1" max="14400" required')),
   }[f]())).join("");
   openDialog(`<div class="dlg-head"><h2>${esc(t("runTitle", { a: t("a." + action)[0], p: p.name }))}</h2><p>${esc(t("a." + action)[1])}</p></div>
     <div class="dlg-body">${fieldsHtml()}</div>${foot(t("run"))}`, async form => {
     const val = k => (form.elements[k] ? form.elements[k].value.trim() : "");
     const target = val("target") || undefined, params = { ...(spec.extra || {}) };
-    if (p.xcode) params[p.xcode.endsWith(".xcworkspace") ? "workspace" : "project"] = p.xcode;
-    ["scheme", "team_id", "bundle_id"].forEach(k => p[k] && (params[k] = p[k]));
-    if (action === "unity") { params.build_target = p.unity_build_target || "iOS"; params.method = p.unity_method || ""; }
+    if (action !== "unity") {
+      if (p.xcode) params[p.xcode.endsWith(".xcworkspace") ? "workspace" : "project"] = p.xcode;
+      ["scheme", "team_id", "bundle_id"].forEach(k => p[k] && (params[k] = p[k]));
+    }
+    if (action === "unity") Object.assign(params, unityRunParams(val));
     if (val("configuration")) params.configuration = val("configuration");
     if (val("export_method")) params.export_method = val("export_method");
     if (val("template")) params.template = val("template");
@@ -915,6 +959,20 @@ function openRun(p, action) {
     const r = await post("/api/jobs", body);
     toast(t("queued", { k: t("a." + action)[0] }) + (r.host && r.host !== S.me.host ? " → " + r.host : "")); await pollCore(); location.hash = jobHash(r);
   }, form => {
+    if (action === "unity") {
+      const syncMode = () => {
+        const testing = form.elements.unity_mode.value === "test";
+        for (const [keys, enabled] of [[["unity_method", "unity_quit"], !testing], [["test_platform", "test_filter", "assembly_names"], testing]]) {
+          for (const key of keys) {
+            form.elements[key].disabled = !enabled;
+            form.elements[key].closest(".field").classList.toggle("hidden", !enabled);
+          }
+        }
+        form.elements.unity_method.required = !testing;
+      };
+      form.elements.unity_mode.onchange = syncMode;
+      syncMode();
+    }
     const tg = form.elements.target;
     if (tg && form.elements.host) tg.addEventListener("change", () => { form.elements.host.innerHTML = hostOptions(tg.value).map(([a, b]) => `<option value="${esc(a)}">${esc(b)}</option>`).join(""); });
     if (tg && form.elements.device) tg.onchange = () => { const sel = form.elements.device; sel.innerHTML = deviceOptions(tg.value, { generic: spec.generic }).map(([a, b]) => `<option value="${esc(a)}">${esc(b)}</option>`).join("");
@@ -928,7 +986,7 @@ async function queueQuick(body) {
 }
 async function rerun(s, host) {
   const body = { project: s.project, repo: s.repo || undefined, commit: s.commit, kind: s.kind, target: s.target || undefined,
-    device: s.device || undefined, args: s.args || undefined, params: s.params || undefined, host: host || undefined };
+    device: s.device || undefined, args: s.args || undefined, params: s.params || undefined, requires: s.requires || undefined, host: host || undefined };
   const r = await post("/api/jobs", body); toast(t("queued", { k: kname(s.kind) })); await pollCore(); location.hash = jobHash(r);
 }
 function openProject(p) {

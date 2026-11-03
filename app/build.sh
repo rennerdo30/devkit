@@ -15,7 +15,7 @@ ROOT="$(dirname "$HERE")"
 DIST="$ROOT/dist"
 APP="$DIST/Devkit.app"
 BUNDLE_ID="${DEVKIT_BUNDLE_ID:-io.github.rennerdo30.devkit}"
-VERSION="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$ROOT/bin/devkit-server")"
+VERSION="$(PYTHONPATH="$ROOT/lib" /usr/bin/python3 -c 'from devkit_build import VERSION; print(VERSION)')"
 BUILD="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)"
 
 echo "==> building Devkit $VERSION ($BUILD)"
@@ -30,6 +30,7 @@ cp "$HERE/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 for d in bin lib web; do
   rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' "$ROOT/$d" "$APP/Contents/Resources/devkit/"
 done
+PYTHONPATH="$ROOT/lib" /usr/bin/python3 -c 'import devkit_build,json; print(json.dumps(devkit_build.identity()))' > "$APP/Contents/Resources/devkit/build-info.json"
 sed -e "s|@BUNDLE_ID@|$BUNDLE_ID|" -e "s|@VERSION@|$VERSION|" -e "s|@BUILD@|$BUILD|" "$HERE/Info.plist.in" > "$APP/Contents/Info.plist"
 plutil -lint -s "$APP/Contents/Info.plist"
 
